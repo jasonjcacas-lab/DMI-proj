@@ -1,0 +1,94 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.cursor/
+
+# Project specific
+*.pyc
+*.pyo
+*.pyd
+
+# Cache and temporary files
+Cache/
+*.cache
+*.log
+
+# Settings files (may contain sensitive data)
+mvr_settings.json
+ui_settings.json
+*.user
+*.sln
+
+# Output directories
+Bindocs_output/
+
+# Large PDF files and binaries (uncomment if you don't want to track these)
+# other files/
+# Bindocs/*.pdf
+# *.pdf
+
+# Executables
+*.exe
+*.lnk
+
+# OS files
+Thumbs.db
+desktop.ini
+
+# System directories (Windows)
+AppData/
+Application Data/
+Cookies/
+Local Settings/
+My Documents/
+NetHood/
+PrintHood/
+Recent/
+SendTo/
+Start Menu/
+Templates/
+Documents/My Music/
+Documents/My Pictures/
+Documents/My Videos/
+.VirtualBox/
+.android/
+.dotnet/
+.packettracer/
+.python_history/
+.gitconfig
+
+# 3D Objects
+3D Objects/
+

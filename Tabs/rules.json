@@ -1,0 +1,1466 @@
+[
+  {
+    "name": "Proposal",
+    "scope": "range",
+    "priority": 100,
+    "forbid_any": [
+      "(?s)\\bTHEFT\\s+EXCLUSION\\b",
+      "(?s)\\bNAMED\\s+DRIVER\\s+EXCLUSION\\b",
+      "(?s)\\bNAMED\\s+DRIVER\\s+EXCLUSION\\s*-\\s*NORTH\\s+CAROLINA\\b",
+      "(?s)\\bNAMED\\s+DRIVER\\s+EXCLUSION\\s*[–-]\\s*SOUTH\\s+CAROLINA\\b"
+    ],
+    "start": {
+      "any_cues": [
+        "(?s)\\bPLEASE\\s+FIND\\s+ATTACHED\\s+PREMIUM\\s+INDICATION\\b",
+        "(?s)\\bBELOW\\s+IS\\s+A\\s+PREMIUM\\s+AND\\s+FEE\\s+SUMMARY\\b",
+        "(?s)\\bPLEASE\\s+FIND\\s+ATTACHED\\s+(THE\\s+)?RENEWAL\\s+QUOTE\\b.*\\bSUMMARY\\s+OF\\s+THE\\s+PROPOSAL\\b"
+      ],
+      "next_page_hits": [
+        "(?s)\\bPROPOSAL\\s*NO\\b",
+        "(?s)\\bPOLICY\\s*NUMBER\\b",
+        "(?s)\\bEFFECTIVE\\s*DATE\\b",
+        "(?s)\\bPOLICY\\s*EXPIRATION\\b"
+      ],
+      "min_hits_next": 1,
+      "lookback_header": true
+    },
+    "end": {
+      "first_cue": [
+        "(?s)\\bTHANK\\s+YOU\\s+FOR\\s+YOUR\\s+BUSINESS\\b",
+        "(?s)\\bTHIS\\s+QUOTATION\\s+IS\\s+ONLY\\s+A\\s+SUMMARY\\b",
+        "(?s)\\bTHIS\\s+SIGNED\\s+PROPOSAL\\s+SHALL\\s+BE\\s+MADE\\s+PART\\b",
+        "(?s)\\bTHIS\\s+ACCEPTED\\s+QUOTATION\\s+REPLACES\\s+ANY\\s+INDICATION\\b"
+      ],
+      "fallback_to_end": true
+    },
+    "output": { "filename": "YY Proposal.pdf" }
+  },
+
+  {
+    "name": "Signature Certificate",
+    "scope": "range",
+    "priority": 95,
+    "start": {
+      "any_cues": [
+        "(?s)\\bDOCUMENT\\s+COMPLETION\\s+CERTIFICATE\\b",
+        "(?s)\\bDEALER\\s+POLICY\\s+BIND\\s+PACKAGE\\b"
+      ]
+    },
+    "end": { "mode": "signature_rules" },
+    "output": { "filename": "YY Signature Certificate.pdf" }
+  },
+
+  {
+    "name": "Statement of No Loss",
+    "scope": "single_page",
+    "priority": 90,
+    "require_any": [ "(?s)\\bSTATEMENT\\s+OF\\s+NO\\s+LOSS\\b" ],
+    "helpful_cues": [
+      "(?s)\\bI\\s+CERTIFY\\s+THAT\\s+I\\s+AM\\s+NOT\\s+AWARE\\s+OF\\s+ANY\\s+LOSSES\\b",
+      "(?s)\\bCIRCUMSTANCES\\s+THAT\\s+MIGHT\\s+GIVE\\s+RISE\\s+TO\\s+A\\s+CLAIM\\b",
+      "(?s)\\bRECEIPT\\b",
+      "(?s)\\bAMOUNT\\s+RECEIVED\\s+BY\\b"
+    ],
+    "min_helpful": 1,
+    "output": {
+      "prompt": true,
+      "filename": "YY Statement of No Loss ["
+    }
+  },
+  {
+    "name": "Non-Dealer Application",
+    "scope": "range",
+    "priority": 88,
+    "start": {
+      "any_cues": [
+        "(?s)\\bNON[-\\s]+DEALER\\s+APPLICATION\\b"
+      ],
+      "lookback_header": false
+    },
+    "helpful_cues": [
+      "(?s)\\bSMOG\\s+TESTING\\b"
+    ],
+    "min_helpful": 1,
+    "end": {
+      "first_cue": [
+        "(?s)\\bBROKER[’'`]S\\s+SIGNATURE\\s+OF\\s+COMPLETION\\b",
+        "(?s)\\bNON[-\\s]+OWNED\\s+AUTO\\s+LIABILITY\\b",
+        "(?s)\\bCOMMERCIAL\\s+GENERAL\\s+LIABILITY\\b"
+      ],
+      "max_pages": 4,
+      "fallback_to_end": true
+    },
+    "output": {
+      "prompt": false,
+      "filename": "YY Non-Dealer Application.pdf"
+    }
+  },
+  {
+    "name": "Property Application",
+    "scope": "range",
+    "priority": 87,
+    "start": {
+      "any_cues": [
+        "(?s)\\bPROPERTY\\s+SUPPLEMENTAL\\b",
+        "(?s)\\bPROPERTY\\s+APPLICATION\\b"
+      ],
+      "lookback_header": false
+    },
+    "helpful_cues": [
+      "(?s)\\bMINIMUM\\s+90\\s*%?\\s+CO[-\\s]+INSURANCE\\s+APPLIES\\s+TO\\s+ALL\\s+PROPERTY\\s+COVERAGE\\b"
+    ],
+    "min_helpful": 0,
+    "require_any": [
+      "(?s)\\bMINIMUM\\s+90\\s*%?\\s+CO[-\\s]+INSURANCE\\b"
+    ],
+    "end": {
+      "first_cue": [
+        "(?s)\\bLIST\\s+ALL\\s+PROPERTY\\s*,?\\s+CRIME\\s+AND\\s+INLAND\\s+MARINE\\s+LOSSES\\s+IN\\s+LAST\\s+4\\s+YEARS\\b",
+        "(?s)\\bBROKER[’'`]S\\s+SIGNATURE\\s+OF\\s+COMPLETION\\b",
+        "(?s)\\bPROPERTY\\s*,?\\s+CRIME\\s+AND\\s+INLAND\\s+MARINE\\b"
+      ],
+      "max_pages": 4,
+      "fallback_to_end": true
+    },
+    "output": {
+      "prompt": false,
+      "filename": "YY Property Application.pdf"
+    }
+  },
+  {
+    "name": "Location Page DA",
+    "scope": "single_page",
+    "priority": 86,
+    "start": {
+      "any_cues": [
+        "(?s)\\bLOCATION\\s+INFORMATION\\b",
+        "(?s)\\bCOMPLETE\\s+A\\s+SEPARATE\\s+FORM\\s+FOR\\s+EACH\\s+LOCATION\\b"
+      ]
+    },
+    "helpful_cues": [
+      "(?s)\\bANSWER\\s+THE\\s+FOLLOWING\\s+QUESTIONS\\s+IF\\s+THERE\\s+IS\\s+A\\s+SERVICE\\s*/\\s*REPAIR\\s+FACILITY\\s+ON\\s+PREMISES\\b"
+    ],
+    "min_helpful": 1,
+    "output": {
+      "prompt": false,
+      "filename": "YY Location Page DA.pdf"
+    }
+  },
+  {
+    "name": "Car Hauler Application",
+    "scope": "single_page",
+    "priority": 85,
+    "start": {
+      "any_cues": [
+        "(?s)\\bCAR\\s+HAULER\\s+SUPPLEMENTAL\\b"
+      ]
+    },
+    "helpful_cues": [
+      "(?s)\\bATTACH\\s+PHOTO\\s+OF\\s+EACH\\s+HAULER\\s+TO\\s+SUBMISSION\\b"
+    ],
+    "min_helpful": 1,
+    "output": {
+      "prompt": false,
+      "filename": "YY Car Hauler Application.pdf"
+    }
+  },
+  {
+    "name": "Physician Statement",
+    "scope": "single_page",
+    "priority": 84,
+    "start": {
+      "any_cues": [
+        "(?s)\\bPHYSICIAN[’'`]S\\s+STATEMENT\\b"
+      ]
+    },
+    "helpful_cues": [
+      "(?s)\\bMENTAL\\s+CONDITION\\b"
+    ],
+    "min_helpful": 1,
+    "output": {
+      "prompt": false,
+      "filename": "YY Physician Statement.pdf"
+    }
+  },
+  {
+    "name": "Cyber Application",
+    "scope": "single_page",
+    "priority": 83,
+    "start": {
+      "any_cues": [
+        "(?s)\\bCYBER\\s+LIABILITY\\s+PROGRAM\\s+ENROLLMENT\\b"
+      ]
+    },
+    "helpful_cues": [
+      "(?s)\\bCYBER\\s+LIABILITY\\s+PROGRAM\\s+DETAILS\\b"
+    ],
+    "min_helpful": 1,
+    "output": {
+      "prompt": false,
+      "filename": "YY Cyber Application.pdf"
+    }
+  },
+
+  {
+    "name": "Theft Exclusion",
+    "scope": "single_page",
+    "priority": 86,
+    "require_any": [ "(?s)\\bTHEFT\\s+EXCLUSION\\b" ],
+    "helpful_cues": [
+      "(?s)\\bTHIS\\s+ENDORSEMENT\\s+CHANGES\\s+THE\\s+POLICY\\b",
+      "(?s)\\bPLEASE\\s+READ\\s+IT\\s+CAREFULLY\\b"
+    ],
+    "min_helpful": 1,
+    "output": { "filename": "YY Theft Exclusion.pdf" }
+  },
+
+  {
+    "name": "Limited Named Driver Exclusion - Florida",
+    "scope": "single_page",
+    "priority": 92,
+    "require_any": [ "(?s)\\bNAMED\\s+DRIVER\\s+EXCLUSION\\b" ],
+    "helpful_cues": [ "(?s)\\bLIMITED\\b", "(?s)\\bFLORIDA\\b" ],
+    "min_helpful": 2,
+    "forbid_any": [
+      "(?s)\\bNORTH\\s+CAROLINA\\b",
+      "(?s)\\bSOUTH\\s+CAROLINA\\b"
+    ],
+    "output": {
+      "prompt": true,
+      "filename": "YY Limited Named Driver Exclusion FL ["
+    }
+  },
+
+  {
+    "name": "Limited Named Driver Exclusion",
+    "scope": "single_page",
+    "priority": 89,
+    "require_any": [ "(?s)\\bNAMED\\s+DRIVER\\s+EXCLUSION\\b" ],
+    "helpful_cues": [ "(?s)\\bLIMITED\\b" ],
+    "min_helpful": 1,
+    "forbid_any": [
+      "(?s)\\bNORTH\\s+CAROLINA\\b",
+      "(?s)\\bSOUTH\\s+CAROLINA\\b",
+      "(?s)\\bFLORIDA\\b"
+    ],
+    "output": {
+      "prompt": true,
+      "filename": "YY Limited Named Driver Exclusion ["
+    }
+  },
+
+  {
+    "name": "Named Driver Exclusion - North Carolina",
+    "scope": "single_page",
+    "priority": 88,
+    "require_any": [ "(?s)\\bNAMED\\s+DRIVER\\s+EXCLUSION\\b" ],
+    "helpful_cues": [ "(?s)\\bNORTH\\s+CAROLINA\\b" ],
+    "min_helpful": 1,
+    "forbid_any": [
+      "(?s)\\bLIMITED\\b",
+      "(?s)\\bSOUTH\\s+CAROLINA\\b",
+      "(?s)\\bFLORIDA\\b"
+    ],
+    "output": {
+      "prompt": true,
+      "filename": "YY Named Driver Exclusion NC ["
+    }
+  },
+
+  {
+    "name": "Named Driver Exclusion - South Carolina",
+    "scope": "single_page",
+    "priority": 88,
+    "require_any": [ "(?s)\\bNAMED\\s+DRIVER\\s+EXCLUSION\\b" ],
+    "helpful_cues": [ "(?s)\\bSOUTH\\s+CAROLINA\\b" ],
+    "min_helpful": 1,
+    "forbid_any": [
+      "(?s)\\bLIMITED\\b",
+      "(?s)\\bNORTH\\s+CAROLINA\\b",
+      "(?s)\\bFLORIDA\\b"
+    ],
+    "output": {
+      "prompt": true,
+      "filename": "YY Named Driver Exclusion SC ["
+    }
+  },
+
+  {
+    "name": "Named Driver Exclusion - Washington",
+    "scope": "single_page",
+    "priority": 88,
+    "require_any": [ "(?s)\\bNAMED\\s+DRIVER\\s+EXCLUSION\\b" ],
+    "helpful_cues": [ "(?s)\\bWASHINGTON\\b" ],
+    "min_helpful": 1,
+    "forbid_any": [
+      "(?s)\\bLIMITED\\b",
+      "(?s)\\bNORTH\\s+CAROLINA\\b",
+      "(?s)\\bSOUTH\\s+CAROLINA\\b",
+      "(?s)\\bFLORIDA\\b"
+    ],
+    "output": {
+      "prompt": true,
+      "filename": "YY Named Driver Exclusion WS ["
+    }
+  },
+
+  {
+    "name": "Named Driver Exclusion",
+    "scope": "single_page",
+    "priority": 90,
+    "start": {
+      "any_cues": [
+        "(?s)\\bNAMED\\s+DRIVER\\s+EXCLUSION\\b",
+        "(?s)\\bTHIS\\s+ENDORSEMENT\\s+CHANGES\\s+THE\\s+POLICY\\b"
+      ],
+      "lookback_header": false
+    },
+    "require_any": [
+      "(?s)\\bNAMED\\s+DRIVER\\s+EXCLUSION\\b",
+      "(?s)\\bSCHEDULE\\b"
+    ],
+    "helpful_cues": [
+      "(?s)\\bTHIS\\s+ENDORSEMENT\\s+CHANGES\\s+THE\\s+POLICY\\b",
+      "(?s)\\bEXCLUDED\\s+DRIVER\\b"
+    ],
+    "min_helpful": 1,
+    "forbid_any": [
+      "(?s)\\bLIMITED\\b",
+      "(?s)\\bNORTH\\s+CAROLINA\\b",
+      "(?s)\\bSOUTH\\s+CAROLINA\\b",
+      "(?s)\\bFLORIDA\\b",
+      "(?s)\\bWASHINGTON\\b"
+    ],
+    "output": {
+      "prompt": true,
+      "filename": "YY Named Driver Exclusion ["
+    }
+  },
+
+  {
+    "name": "Non-Listed Driver Limitation",
+    "scope": "range",
+    "priority": 87,
+    "start": {
+      "any_cues": [
+        "(?s)\\bNON[-\\s]+LISTED\\s+DRIVER\\s+LIMITATION\\s+ENDORSEMENT\\b",
+        "(?s)\\bSCHEDULE\\s+PERMISSIVE\\s+USER(?:\\s+S)?\\b"
+      ],
+      "fallback_cues": [
+        "(?s)\\bSCHEDULE\\s+PERMISSIVE\\s+USER(?:\\s+S)?\\b"
+      ],
+      "fallback_to_previous": true,
+      "lookback_header": true,
+      "lookback_prev_forbid": [
+        "(?s)\\bNAMED\\s+DRIVER\\s+EXCLUSION\\b",
+        "(?s)\\bSTATEMENT\\s+OF\\s+NO\\s+LOSS\\b"
+      ]
+    },
+    "helpful_cues": [
+      "(?s)\\bSCHEDULE\\b"
+    ],
+    "min_helpful": 0,
+    "forbid_any": [
+      "(?s)\\bNAMED\\s+DRIVER\\s+EXCLUSION\\b"
+    ],
+    "end": {
+      "first_cue": [
+        "(?s)\\bSCHEDULE\\s+PERMISSIVE\\s+USER(?:\\s+S)?\\b"
+      ],
+      "max_pages": 3,
+      "fallback_to_end": true
+    },
+    "output": {
+      "prompt": true,
+      "filename": "YY Non-Listed Driver Limitation [",
+      "preview_offset": 1
+    }
+  },
+
+  {
+    "name": "Business Exclusion",
+    "scope": "single_page",
+    "priority": 85,
+    "require_any": [ "(?s)\\bLOCATIONS\\s+AND\\s+OPERATIONS\\s+NOT\\s+COVERED\\b" ],
+    "min_helpful": 0,
+    "forbid_any": [
+      "(?s)\\bLIMITED\\b",
+      "(?s)\\bNORTH\\s+CAROLINA\\b",
+      "(?s)\\bSOUTH\\s+CAROLINA\\b",
+      "(?s)\\bFLORIDA\\b",
+      "(?s)\\bWASHINGTON\\b"
+    ],
+    "output": {
+      "prompt": true,
+      "filename": "YY Business Exclusion ["
+    }
+  },
+
+  {
+    "name": "Windstorm and Flood Exclusion",
+    "scope": "range",
+    "priority": 79,
+    "start": {
+      "any_cues": [
+        "(?s)\\bWINDSTORM\\s+AND\\s+FLOOD\\s+EXCLUSION\\b"
+      ],
+      "lookback_header": false
+    },
+    "forbid_any": [
+      "(?s)\\bWASHINGTON\\b"
+    ],
+    "helpful_cues": [
+      "(?s)\\bTHIS\\s+ENDORSEMENT\\s+CHANGES\\s+THE\\s+POLICY\\b"
+    ],
+    "min_helpful": 1,
+    "end": {
+      "first_cue": [
+        "(?s)\\bSIGNATURE\\s+OF\\s+INSURED\\b"
+      ],
+      "fallback_to_end": true
+    },
+    "output": {
+      "filename": "YY Windstorm and Flood Exclusion.pdf"
+    }
+  },
+
+
+  {
+    "name": "Windstorm and Flood Exclusion - Washington",
+    "scope": "range",
+    "priority": 80,
+    "start": {
+      "any_cues": [
+        "(?s)(?=.*\\bWASHINGTON\\b).*\\bWINDSTORM\\s+AND\\s+FLOOD\\s+EXCLUSION\\b"
+      ],
+      "lookback_header": false
+    },
+    "require_any": [
+      "(?s)\\bWASHINGTON\\b"
+    ],
+    "helpful_cues": [
+      "(?s)\\bTHIS\\s+ENDORSEMENT\\s+CHANGES\\s+THE\\s+POLICY\\b"
+    ],
+    "min_helpful": 1,
+    "end": {
+      "first_cue": [
+        "(?s)\\bSIGNATURE\\s+OF\\s+INSURED\\b"
+      ],
+      "fallback_to_end": true
+    },
+    "output": {
+      "filename": "YY Windstorm and Flood Exclusion - WS.pdf"
+    }
+  },
+
+  {
+    "name": "Liquefied Petroleum Gases Exclusion",
+    "scope": "range",
+    "priority": 78,
+    "start": {
+      "any_cues": [
+        "(?s)\\bLIQUEFIED\\s+PETROLEUM\\s+GASES\\s+EXCLUSION\\b",
+        "(?s)\\bLPG\\s+EXCLUSION\\b"
+      ],
+      "lookback_header": false
+    },
+    "forbid_any": [
+      "(?s)\\bWASHINGTON\\b"
+    ],
+    "helpful_cues": [
+      "(?s)\\bTHIS\\s+ENDORSEMENT\\s+CHANGES\\s+THE\\s+POLICY\\b"
+    ],
+    "min_helpful": 1,
+    "end": {
+      "first_cue": [
+        "(?s)\\bNAMED\\s+INSUREDS?\\s+SIGNATURE\\b",
+        "(?s)\\bSIGNATURE\\s+OF\\s+(THE\\s+)?INSURED\\b",
+        "(?s)\\bINSURED\\s+SIGNATURE\\b"
+      ],
+      "near_bottom_frac": 0.40,
+      "stop_before_new_start": true,
+      "max_pages": 2,
+      "fallback_to_end": true
+    },
+    "output": {
+      "filename": "YY Liquefied Petroleum Gases Exclusion.pdf"
+    }
+  },
+
+  {
+    "name": "Leased, Rented or Loaned Auto Exclusion",
+    "scope": "single_page",
+    "priority": 79,
+    "start": {
+      "any_cues": [
+        "(?s)\\bLEASED\\s*,?\\s*RENTED\\s+OR\\s+LOANED\\s+AUTO\\s+EXCLUSION\\b"
+      ],
+      "lookback_header": false
+    },
+    "forbid_any": [
+      "(?s)\\bUSED\\b",
+      "(?s)\\bTIRE\\b",
+      "(?s)\\bTIRES\\b"
+    ],
+    "helpful_cues": [
+      "(?s)\\bTHIS\\s+ENDORSEMENT\\s+CHANGES\\s+THE\\s+POLICY\\b",
+      "(?s)\\bPLEASE\\s+READ\\s+IT\\s+CAREFULLY\\b"
+    ],
+    "min_helpful": 1,
+    "output": {
+      "filename": "YY Leased, Rented or Loaned Auto Exclusion.pdf"
+    }
+  },
+
+  {
+    "name": "Used Tires Exclusion Endorsement",
+    "scope": "single_page",
+    "priority": 78,
+    "start": {
+      "any_cues": [
+        "(?s)\\bUSED\\s+TIRES?\\s+EXCLUSION\\s+ENDORSEMENT\\b"
+      ],
+      "lookback_header": false
+    },
+    "helpful_cues": [
+      "(?s)\\bTHIS\\s+ENDORSEMENT\\s+CHANGES\\s+THE\\s+POLICY\\b",
+      "(?s)\\bPLEASE\\s+READ\\s+IT\\s+CAREFULLY\\b"
+    ],
+    "min_helpful": 1,
+    "output": {
+      "filename": "YY Used Tires Exclusion Endorsement.pdf"
+    }
+  },
+
+  {
+    "name": "Excess Hazards Coverage NY",
+    "scope": "single_page",
+    "priority": 82,
+    "start": {
+      "any_cues": [
+        "(?s)\\bEXCLUSION\\s+OR\\s+EXCESS\\s+COVERAGE\\b.*?\\bHAZARDS\\s+OTHERWISE\\s+INSURED\\b",
+        "(?s)\\bHAZARDS\\s+OTHERWISE\\s+INSURED\\b.*?\\bEXCLUSION\\s+OR\\s+EXCESS\\s+COVERAGE\\b",
+        "(?s)\\bEXCLUSION\\s+OR\\s+EXCESS\\s+COVERAGE\\s*[–-]\\s*HAZARDS\\s+OTHERWISE\\s+INSURED\\b"
+      ],
+      "lookback_header": false
+    },
+    "forbid_any": [
+      "(?s)\\bSECTION\\s+I.*?COVERED\\s+AUTOS.*?COVERAGES\\b",
+      "(?s)\\bSECTION\\s+I.*?COVERAGES\\b",
+      "(?s)\\bSECTION\\s+I\\s+COVERED\\s+AUTOS\\b",
+      "(?s)\\bSECTION\\s+I\\s+COVERAGES\\b",
+      "(?s)\\bSECTION\\s+I.*?COVERED\\s+AUTOS\\s+COVERAGES\\b"
+    ],
+    "require_any": [
+      "(?s)\\bSCHEDULE\\b"
+    ],
+    "helpful_cues": [
+      "(?s)\\bTHIS\\s+ENDORSEMENT\\s+CHANGES\\s+THE\\s+POLICY\\b",
+      "(?s)\\bPLEASE\\s+READ\\s+IT\\s+CAREFULLY\\b"
+    ],
+    "min_helpful": 1,
+    "output": {
+      "filename": "YY Excess Hazards Coverage NY.pdf"
+    }
+  },
+
+  {
+    "name": "Excess Hazards Coverage",
+    "scope": "single_page",
+    "priority": 81,
+    "start": {
+      "any_cues": [
+        "(?s)\\bEXCLUSION\\s+OR\\s+EXCESS\\s+COVERAGE\\b.*?\\bHAZARDS\\s+OTHERWISE\\s+INSURED\\b",
+        "(?s)\\bHAZARDS\\s+OTHERWISE\\s+INSURED\\b.*?\\bEXCLUSION\\s+OR\\s+EXCESS\\s+COVERAGE\\b",
+        "(?s)\\bEXCLUSION\\s+OR\\s+EXCESS\\s+COVERAGE\\s*[–-]\\s*HAZARDS\\s+OTHERWISE\\s+INSURED\\b"
+      ],
+      "lookback_header": false
+    },
+    "forbid_any": [
+      "(?s)\\bCOMMERCIAL\\s+AUTO\\b",
+      "(?s)\\bUSED\\s+TIRES?\\b",
+      "(?s)\\bLEASED\\s*,?\\s*RENTED\\s+OR\\s+LOANED\\b",
+      "(?s)\\bLIQUEFIED\\s+PETROLEUM\\s+GASES?\\b",
+      "(?s)\\bWINDSTORM\\s+AND\\s+FLOOD\\b",
+      "(?s)\\bLEASED\\s*,?\\s*RENTED\\s+OR\\s+LOANED\\s+AUTO\\s+EXCLUSION\\b"
+    ],
+    "require_any": [
+      "(?s)\\bSECTION\\s+I.*?COVERED\\s+AUTOS.*?COVERAGES\\b",
+      "(?s)\\bSECTION\\s+I.*?COVERAGES\\b",
+      "(?s)\\bSECTION\\s+I\\s+COVERED\\s+AUTOS\\b",
+      "(?s)\\bSECTION\\s+I\\s+COVERAGES\\b",
+      "(?s)\\bCOVERED\\s+AUTOS.*?COVERAGES\\b"
+    ],
+    "helpful_cues": [
+      "(?s)\\bTHIS\\s+ENDORSEMENT\\s+CHANGES\\s+THE\\s+POLICY\\b",
+      "(?s)\\bPLEASE\\s+READ\\s+IT\\s+CAREFULLY\\b"
+    ],
+    "min_helpful": 1,
+    "output": {
+      "filename": "YY Excess Hazards Coverage.pdf"
+    }
+  },
+
+
+  
+
+  {
+    "name": "Dealer Application",
+    "scope": "range",
+    "priority": 88,
+    "start": {
+      "any_cues": [
+        "(?s)\\bDEALER\\s+APPLICATION\\b"
+      ],
+      "lookback_header": false
+    },
+    "require_any": [
+      "(?s)\\bNEW\\s+BUSINESS\\s+QUOTE\\b",
+      "(?s)\\bRENEWAL\\s+OF\\s+POL\\b"
+    ],
+    "helpful_cues": [
+      "(?s)\\bAPPLICATION\\b",
+      "(?s)\\bQUOTE\\b"
+    ],
+    "min_helpful": 1,
+    "end": {
+      "first_cue": [
+        "(?s)\\bINDICATE\\s+INTERESTS\\s+TO\\s+BE\\s+COVERED\\b",
+        "(?s)\\bINDICATE.*?INTERESTS.*?COVERED\\b",
+        "(?s)\\bINTERESTS\\s+TO\\s+BE\\s+COVERED\\b",
+        "(?s)\\bAPPLICANT\\s+S\\s+CONSENT\\s+ADVISORY\\s+WARRANTIES\\b",
+        "(?s)\\bAPPLICANT\\s+CONSENT\\s+ADVISORY\\s+WARRANTIES\\b",
+        "(?s)\\bAPPLICANT.*?CONSENT.*?ADVISORY.*?WARRANTIES\\b",
+        "(?s)\\bAPPLICANTS\\s+CONSENT\\s+ADVISORY\\s+WARRANTIES\\b",
+        "(?s)\\bCONSENT.*?ADVISORY.*?WARRANTIES\\b",
+        "(?s)\\bADVISORY.*?WARRANTIES\\b",
+        "(?s)\\bBROKER\\s+S\\s+SIGNATURE\\s+OF\\s+COMPLETION\\b",
+        "(?s)\\bBROKER\\s+S\\s+SIGNATURE\\s+COMPLETION\\b",
+        "(?s)\\bBROKER\\s+SIGNATURE\\s+OF\\s+COMPLETION\\b",
+        "(?s)\\bBROKER\\s+SIGNATURE\\s+COMPLETION\\b",
+        "(?s)\\bBROKERS\\s+SIGNATURE\\s+OF\\s+COMPLETION\\b",
+        "(?s)\\bBROKERS\\s+SIGNATURE\\s+COMPLETION\\b",
+        "(?s)\\bBROKER.*?SIGNATURE.*?COMPLETION\\b",
+        "(?s)\\bSIGNATURE\\s+OF\\s+COMPLETION\\b",
+        "(?s)\\bSIGNATURE\\s+COMPLETION\\b",
+        "(?s)\\bSIGNATURE.*?COMPLETION\\b"
+      ],
+      "max_pages": 10,
+      "fallback_to_end": true
+    },
+    "output": {
+      "filename": "YY Dealer Application.pdf"
+    }
+  },
+
+
+    {
+      "name": "Supplemental Spousal Liability",
+      "scope": "single_page",
+      "priority": 70,
+      "require_any": [ "(?s)\\bSUPPLEMENTAL\\s+SPOUSAL\\s+LIABILITY\\b" ],
+      "helpful_cues": [ "(?s)\\bCOVERAGE\\b", "(?s)\\bNOTICE\\b" ],
+      "min_helpful": 0,
+      "output": { "filename": "YY Supplemental Spousal Liability.pdf" }
+    },
+
+
+
+    {
+      "name": "Unlicensed Driver Statement",
+      "scope": "single_page",
+      "priority": 80,
+      "require_any": [ "(?s)\\bUNLICENSED\\s+DRIVER\\s+STATEMENT\\b" ],
+      "helpful_cues": [
+        "(?s)\\bUNLICENSED\\s+DRIVER\\b",
+        "(?s)\\bI\\s+UNDERSTAND\\b"
+      ],
+      "min_helpful": 0,
+      "output": {
+        "prompt": true,
+        "filename": "YY Unlicensed Driver Statement ["
+      }
+    },
+
+    {
+      "name": "Experience Questionnaire",
+      "scope": "single_page",
+      "priority": 85,
+      "require_any": [
+        "(?s)\\bEXPERIENCE\\s+QUESTIONNAIRE\\s+BUSINESSES\\s+IN\\s+OPERATION\\s+LESS\\s+THAN\\s+3\\s+YEARS\\b",
+        "(?s)\\bEXPERIENCE\\s+QUESTIONNAIRE\\b.*?\\bBUSINESSES\\s+IN\\s+OPERATION\\b.*?\\bLESS\\s+THAN\\s+3\\s+YEARS\\b"
+      ],
+      "helpful_cues": [
+        "(?s)\\bEMPLOYMENT\\s+HISTORY\\b",
+        "(?s)\\bLIST\\s+ALL\\s+EMPLOYMENT\\s+IN\\s+THE\\s+LAST\\s+4\\s+YEARS\\b",
+        "(?s)\\bBEGINNING\\s+WITH\\s+YOUR\\s+CURRENT\\s+OR\\s+MOST\\s+RECENT\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY Experience Questionnaire.pdf"
+      }
+    },
+
+    {
+      "name": "SSA AL",
+      "scope": "single_page",
+      "priority": 84,
+      "start": {
+        "any_cues": [
+          "(?s)\\bALABAMA\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bALABAMA.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bALABAMA\\s+SPECIFIC\\s+COVERAGES.*?LIMITS.*?SELECTION\\b",
+        "(?s)\\bALABAMA\\s+SPECIFIC\\s+COVERAGES\\b",
+        "(?s)\\bLIMITS\\s+SELECTION\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY AL SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA AZ",
+      "scope": "single_page",
+      "priority": 82,
+      "start": {
+        "any_cues": [
+          "(?s)\\bARIZONA\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bARIZONA.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bARIZONA\\s+SPECIFIC\\s+COVERAGES.*?LIMITS.*?SELECTION\\b",
+        "(?s)\\bARIZONA\\s+SPECIFIC\\s+COVERAGES\\b",
+        "(?s)\\bLIMITS\\s+SELECTION\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY AZ SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA CA",
+      "scope": "single_page",
+      "priority": 81,
+      "start": {
+        "any_cues": [
+          "(?s)\\bCALIFORNIA.*?AUTOMOTIVE\\s+PROGRAM\\s+SPECIALISTS.*?WWW\\s+DMI\\s+INSURANCE\\s+COM.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bCALIFORNIA\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bCALIFORNIA.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bAUTOMOTIVE\\s+PROGRAM\\s+SPECIALISTS\\b",
+        "(?s)\\bWWW\\s+DMI\\s+INSURANCE\\s+COM\\b",
+        "(?s)\\bDMI\\s+INSURANCE\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY CA SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA CO",
+      "scope": "single_page",
+      "priority": 80,
+      "start": {
+        "any_cues": [
+          "(?s)\\bCOLORADO\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bCOLORADO.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bCOLORADO\\s+SPECIFIC\\s+COVERAGES.*?LIMITS.*?SELECTION\\b",
+        "(?s)\\bCOLORADO\\s+SPECIFIC\\s+COVERAGES\\b",
+        "(?s)\\bLIMITS\\s+SELECTION\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY CO SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA GA",
+      "scope": "single_page",
+      "priority": 79,
+      "start": {
+        "any_cues": [
+          "(?s)\\bGEORGIA\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bGEORGIA.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bGEORGIA\\s+SPECIFIC\\s+COVERAGES.*?LIMITS.*?SELECTION\\b",
+        "(?s)\\bGEORGIA\\s+SPECIFIC\\s+COVERAGES\\b",
+        "(?s)\\bLIMITS\\s+SELECTION\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY GA SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA ID",
+      "scope": "single_page",
+      "priority": 78,
+      "start": {
+        "any_cues": [
+          "(?s)\\bIDAHO\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bIDAHO.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bIDAHO\\s+SPECIFIC\\s+COVERAGES.*?LIMITS.*?SELECTION\\b",
+        "(?s)\\bIDAHO\\s+SPECIFIC\\s+COVERAGES\\b",
+        "(?s)\\bLIMITS\\s+SELECTION\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY ID SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA IL",
+      "scope": "single_page",
+      "priority": 77,
+    "require_any": [
+      "(?s)\\bILLINOIS\\b"
+    ],
+      "start": {
+        "any_cues": [
+          "(?s)\\bILLINOIS\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bILLINOIS.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+        "(?s)\\bILLINOIS\\s+UNINSURED\\s+MOTORISTS\\s+COVERAGE\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bSELECTION\\s*/\\s*REJECTION\\b",
+        "(?s)\\bUNINSURED\\s+MOTORISTS\\b",
+        "(?s)\\bUNDERINSURED\\s+MOTORISTS\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY IL SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA IN",
+      "scope": "single_page",
+      "priority": 76,
+      "start": {
+        "any_cues": [
+          "(?s)\\bINDIANA\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bINDIANA.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bINDIANA\\s+SPECIFIC\\s+COVERAGES.*?LIMITS.*?SELECTION\\b",
+        "(?s)\\bINDIANA\\s+SPECIFIC\\s+COVERAGES\\b",
+        "(?s)\\bLIMITS\\s+SELECTION\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY IN SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA KS",
+      "scope": "single_page",
+      "priority": 75,
+      "start": {
+        "any_cues": [
+          "(?s)\\bKANSAS\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bKANSAS.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bKANSAS\\s+SPECIFIC\\s+COVERAGES.*?LIMITS.*?SELECTION\\b",
+        "(?s)\\bKANSAS\\s+SPECIFIC\\s+COVERAGES\\b",
+        "(?s)\\bKANSAS.*?SPECIFIC.*?COVERAGES.*?LIMITS.*?SELECTION\\b",
+        "(?s)\\bLIMITS.*?SELECTION\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY KS SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA MI",
+      "scope": "range",
+      "priority": 74,
+      "start": {
+        "any_cues": [
+          "(?s)\\bMICHIGAN.*?AUTOMOTIVE\\s+PROGRAM\\s+SPECIALISTS.*?WWW\\s+DMI\\s+INSURANCE\\s+COM.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bMICHIGAN\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bMICHIGAN.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bMICHIGAN\\s+SPECIFIC\\s+COVERAGES.*?LIMITS.*?SELECTION\\b",
+        "(?s)\\bMICHIGAN\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "end": {
+        "first_cue": [
+          "(?s)\\bMICHIGAN\\s+CHOICE\\s+OF\\s+BODILY\\s+INJURY\\s+LIABILITY\\s+COVERAGE\\s+LIMITS\\b",
+          "(?s)\\bMICHIGAN.*?CHOICE.*?BODILY.*?INJURY.*?LIABILITY.*?COVERAGE.*?LIMITS\\b",
+          "(?s)\\bBY\\s+SIGNING\\s+THIS\\s+FORM.*?I\\s+ACKNOWLEDGE\\s+THAT.*?I\\s+HAVE\\s+READ\\s+THIS\\s+FORM\\s+OR\\s+HAD\\s+IT\\s+READ\\s+TO\\s+ME\\b",
+          "(?s)\\bBY\\s+SIGNING\\s+THIS\\s+FORM.*?I\\s+ACKNOWLEDGE\\s+THAT\\b",
+          "(?s)\\bI\\s+HAVE\\s+READ\\s+THIS\\s+FORM\\s+OR\\s+HAD\\s+IT\\s+READ\\s+TO\\s+ME\\b"
+        ],
+        "max_pages": 4,
+        "fallback_to_end": true
+      },
+      "output": {
+        "filename": "YY MI SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA MN",
+      "scope": "single_page",
+      "priority": 73,
+      "start": {
+        "any_cues": [
+          "(?s)\\bMINNESOTA\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bMINNESOTA.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bMINNESOTA\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY MN SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA MO",
+      "scope": "single_page",
+      "priority": 72,
+      "start": {
+        "any_cues": [
+          "(?s)\\bMISSOURI\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bMISSOURI.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bMISSOURI\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY MO SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA MS",
+      "scope": "range",
+      "priority": 71,
+      "start": {
+        "any_cues": [
+          "(?s)\\bMISSISSIPPI\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bMISSISSIPPI.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bMISSISSIPPI\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "end": {
+        "first_cue": [
+          "(?s)\\bPRODUCER\\s+S\\s+SIGNATURE\\s+OF\\s+COMPLETION\\b",
+          "(?s)\\bPRODUCER\\s+SIGNATURE\\s+OF\\s+COMPLETION\\b",
+          "(?s)\\bPRODUCERS\\s+SIGNATURE\\s+OF\\s+COMPLETION\\b",
+          "(?s)\\bPRODUCER.*?SIGNATURE.*?COMPLETION\\b"
+        ],
+        "max_pages": 2,
+        "fallback_to_end": true
+      },
+      "output": {
+        "filename": "YY MS SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA NM",
+      "scope": "range",
+      "priority": 70,
+      "start": {
+        "any_cues": [
+          "(?s)\\bNEW\\s+MEXICO\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bNEW\\s+MEXICO.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bNEW\\s+MEXICO\\s+LAW\\s+PERMITS\\s+YOU\\s+TO\\s+MAKE\\s+CERTAIN\\s+DECISIONS\\s+REGARDING\\s+UNINSURED\\s+MOTORISTS\\s+COVERAGE\\b",
+        "(?s)\\bNEW\\s+MEXICO\\s+LAW\\s+PERMITS\\b",
+        "(?s)\\bUNINSURED\\s+MOTORISTS\\s+COVERAGE\\b"
+      ],
+      "min_helpful": 1,
+      "end": {
+        "first_cue": [
+          "(?s)\\bAPPLICANT\\s+S\\s+SIGNATURE\\b",
+          "(?s)\\bAPPLICANT\\s+SIGNATURE\\b",
+          "(?s)\\bAPPLICANTS\\s+SIGNATURE\\b"
+        ],
+        "max_pages": 2,
+        "fallback_to_end": true
+      },
+      "output": {
+        "filename": "YY NM SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA NC",
+      "scope": "single_page",
+      "priority": 69,
+      "start": {
+        "any_cues": [
+          "(?s)\\bNORTH\\s+CAROLINA\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bNORTH\\s+CAROLINA.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bOPTIONAL\\s+SELECTION\\s+OF\\s+UNINSURED.*?UNDERINSURED\\s+MOTORISTS\\s+COVERAGE\\s+LIMITS\\b",
+        "(?s)\\bOPTIONAL\\s+SELECTION\\s+OF\\s+UNINSURED\\s+MOTORISTS\\s+COVERAGE\\b",
+        "(?s)\\bUNDERINSURED\\s+MOTORISTS\\s+COVERAGE\\s+LIMITS\\b",
+        "(?s)\\bUNINSURED.*?UNDERINSURED\\s+MOTORISTS\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY NC SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA NV",
+      "scope": "single_page",
+      "priority": 68,
+      "start": {
+        "any_cues": [
+          "(?s)\\bNEVADA\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bNEVADA.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bNEVADA\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY NV SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA NY",
+      "scope": "single_page",
+      "priority": 67,
+      "start": {
+        "any_cues": [
+          "(?s)\\bNEW\\s+YORK\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bNEW\\s+YORK.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bNEW\\s+YORK\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY NY SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA OH",
+      "scope": "single_page",
+      "priority": 66,
+      "start": {
+        "any_cues": [
+          "(?s)\\bOHIO\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bOHIO.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bOHIO\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY OH SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA OK",
+      "scope": "single_page",
+      "priority": 65,
+      "start": {
+        "any_cues": [
+          "(?s)\\bOKLAHOMA\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bOKLAHOMA.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bOKLAHOMA\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY OK SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA OR",
+      "scope": "single_page",
+      "priority": 64,
+      "start": {
+        "any_cues": [
+          "(?s)\\bOREGON\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bOREGON.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bOREGON\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY OR SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA PA",
+      "scope": "range",
+      "priority": 63,
+      "start": {
+        "any_cues": [
+          "(?s)\\bPENNSYLVANIA\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bPENNSYLVANIA.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bPENNSYLVANIA\\s+LAW\\s+PERMITS\\s+YOU\\s+TO\\s+MAKE\\s+CERTAIN\\s+DECISIONS\\s+REGARDING\\s+UNINSURED.*?UNDERINSURED\\s+MOTORISTS\\s+COVERAGE\\b",
+        "(?s)\\bPENNSYLVANIA\\s+LAW\\s+PERMITS\\b",
+        "(?s)\\bUNINSURED.*?UNDERINSURED\\s+MOTORISTS\\s+COVERAGE\\b"
+      ],
+      "min_helpful": 1,
+      "end": {
+        "first_cue": [
+          "(?s)\\bAPPLICANT\\s+S\\s+SIGNATURE\\b",
+          "(?s)\\bAPPLICANT\\s+SIGNATURE\\b",
+          "(?s)\\bAPPLICANTS\\s+SIGNATURE\\b",
+          "(?s)\\bFIRST\\s+PARTY\\s+BENEFITS\\s+NOTICE\\b"
+        ],
+        "max_pages": 3,
+        "fallback_to_end": true
+      },
+      "output": {
+        "filename": "YY PA SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA SC",
+      "scope": "range",
+      "priority": 62,
+      "start": {
+        "any_cues": [
+          "(?s)\\bSOUTH\\s+CAROLINA\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bSOUTH\\s+CAROLINA.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "end": {
+        "first_cue": [
+          "(?s)\\bAPPLICANT\\s+S\\s+SIGNATURE\\b",
+          "(?s)\\bAPPLICANT\\s+SIGNATURE\\b",
+          "(?s)\\bAPPLICANTS\\s+SIGNATURE\\b"
+        ],
+        "max_pages": 3,
+        "fallback_to_end": true
+      },
+      "output": {
+        "filename": "YY SC SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA RI",
+      "scope": "single_page",
+      "priority": 61,
+      "start": {
+        "any_cues": [
+          "(?s)\\bRHODE\\s+ISLAND\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bRHODE\\s+ISLAND.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bRHODE\\s+ISLAND\\s+LAW\\s+PERMITS\\s+YOU\\s+TO\\s+MAKE\\s+CERTAIN\\s+DECISIONS\\s+REGARDING\\s+UNINSURED\\s+MOTORISTS\\s+COVERAGE\\b",
+        "(?s)\\bRHODE\\s+ISLAND\\s+LAW\\s+PERMITS\\b",
+        "(?s)\\bUNINSURED\\s+MOTORISTS\\s+COVERAGE\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY RI SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA TN",
+      "scope": "single_page",
+      "priority": 60,
+      "start": {
+        "any_cues": [
+          "(?s)\\bTENNESSEE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bTENNESSEE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bTENNESSEE\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY TN SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA TX",
+      "scope": "single_page",
+      "priority": 59,
+      "start": {
+        "any_cues": [
+          "(?s)\\bTEXAS\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bTEXAS.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bTEXAS\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY TX SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA UT",
+      "scope": "single_page",
+      "priority": 58,
+      "start": {
+        "any_cues": [
+          "(?s)\\bUTAH\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bUTAH.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bUTAH\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY UT SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA VA",
+      "scope": "single_page",
+      "priority": 57,
+      "start": {
+        "any_cues": [
+          "(?s)\\bVIRGINIA\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bVIRGINIA.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bVIRGINIA\\s+LAW\\s+PERMITS\\s+YOU\\s+TO\\s+MAKE\\s+CERTAIN\\s+DECISIONS\\s+REGARDING\\s+UNINSURED\\s+MOTORISTS\\s+COVERAGE\\b",
+        "(?s)\\bVIRGINIA\\s+LAW\\s+PERMITS\\b",
+        "(?s)\\bUNINSURED\\s+MOTORISTS\\s+COVERAGE\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY VA SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA WA",
+      "scope": "single_page",
+      "priority": 56,
+      "start": {
+        "any_cues": [
+          "(?s)\\bWASHINGTON\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bWASHINGTON.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bWASHINGTON\\s+SPECIFIC\\s+COVERAGES\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY WA SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA WI",
+      "scope": "single_page",
+      "priority": 55,
+      "start": {
+        "any_cues": [
+          "(?s)\\bWISCONSIN\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bWISCONSIN.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bWISCONSIN\\s+SPECIFIC\\s+COVERAGES\\b",
+          "(?s)\\bLIMITS\\s+SELECTION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bUNINSURED\\s+MOTORISTS\\b",
+        "(?s)\\bUNDERINSURED\\s+MOTORISTS\\b",
+        "(?s)\\bCOVERAGE\\b"
+      ],
+      "min_helpful": 1,
+      "output": {
+        "filename": "YY WI SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA CT",
+      "scope": "range",
+      "priority": 79,
+      "start": {
+        "any_cues": [
+          "(?s)\\bCONNECTICUT.*?AUTOMOTIVE\\s+PROGRAM\\s+SPECIALISTS.*?WWW\\s+DMI\\s+INSURANCE\\s+COM.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bCONNECTICUT\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bCONNECTICUT.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bAUTOMOTIVE\\s+PROGRAM\\s+SPECIALISTS\\b",
+        "(?s)\\bWWW\\s+DMI\\s+INSURANCE\\s+COM\\b",
+        "(?s)\\bDMI\\s+INSURANCE\\b"
+      ],
+      "min_helpful": 1,
+      "end": {
+        "first_cue": [
+          "(?s)\\bAPPLICANT\\s+S\\s+SIGNATURE\\b",
+          "(?s)\\bAPPLICANT\\s+SIGNATURE\\b"
+        ],
+        "max_pages": 3,
+        "fallback_to_end": true
+      },
+      "output": {
+        "filename": "YY CT SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA FL",
+      "scope": "range",
+      "priority": 78,
+      "start": {
+        "any_cues": [
+          "(?s)\\bFLORIDA\\s+GARAGE\\s+INSURANCE\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bFLORIDA.*?GARAGE\\s+INSURANCE.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bFLORIDA\\s+SPECIFIC\\s+COVERAGES.*?LIMITS.*?SELECTION\\b",
+        "(?s)\\bFLORIDA\\s+SPECIFIC\\s+COVERAGES\\b",
+        "(?s)\\bLIMITS\\s+SELECTION\\b"
+      ],
+      "min_helpful": 1,
+      "end": {
+        "first_cue": [
+
+          "(?s)\\bPHYSICAL\\s+DAMAGE\\s+ON\\s+DEALERS\\s+AUTOS\\b",
+          "(?s)\\bPHYSICAL\\s+DAMAGE\\s+ON\\s+DEALER\\s+AUTOS\\b",
+          "(?s)\\bBROKER\\s+S\\s+SIGNATURE\\b",
+          "(?s)\\bBROKER\\s+SIGNATURE\\b",
+          "(?s)\\bBROKERS\\s+SIGNATURE\\b"
+
+        ],
+        "max_pages": 4,
+        "fallback_to_end": true
+      },
+      "output": {
+        "filename": "YY FL SSA.pdf"
+      }
+    },
+
+    {
+      "name": "SSA AR",
+      "scope": "range",
+      "priority": 83,
+      "start": {
+        "any_cues": [
+          "(?s)\\bARKANSAS\\s+STATE\\s+SPECIFIC\\s+APPLICATION\\b",
+          "(?s)\\bARKANSAS.*?STATE\\s+SPECIFIC\\s+APPLICATION\\b"
+        ],
+        "lookback_header": false
+      },
+      "helpful_cues": [
+        "(?s)\\bAUTOMOTIVE\\s+PROGRAM\\s+SPECIALISTS\\b",
+        "(?s)\\bWWW\\s+DMI\\s+INSURANCE\\s+COM\\b",
+        "(?s)\\bDMI\\s+INSURANCE\\b"
+      ],
+      "min_helpful": 1,
+      "end": {
+        "first_cue": [
+          "(?s)\\bINSURED\\s+S\\s+SIGNATURE\\b",
+          "(?s)\\bINSURED\\s+SIGNATURE\\b"
+        ],
+        "max_pages": 3,
+        "fallback_to_end": true
+      },
+      "output": {
+        "filename": "YY AR SSA.pdf"
+      }
+    }
+
+]
