@@ -1,0 +1,93 @@
+import json, os, re, importlib.util
+
+rules_path = os.path.join("Tabs", "rules.json")
+with open(rules_path, encoding="utf-8") as f:
+    rules = json.load(f)
+
+region_path = os.path.join("Tabs", "region_hints.py")
+region_hints = []
+if os.path.exists(region_path):
+    spec = importlib.util.spec_from_file_location("Tabs.region_hints", region_path)
+    if spec and spec.loader:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        region_hints = getattr(module, "REGION_HINTS", [])
+
+_region_lookup = {}
+for item in region_hints or []:
+    rule = item.get("rule")
+    target = item.get("target")
+    pattern = item.get("pattern")
+    bands = item.get("bands") or []
+    if not rule or not target or not pattern or not bands:
+        continue
+    key = (rule, target, pattern)
+    _region_lookup.setdefault(key, []).extend(bands)
+
+def _pretty(pattern: str) -> str:
+    """Strip (?s), word-boundary tokens, regex escapes, etc."""
+    if not isinstance(pattern, str):
+        return str(pattern)
+    text = pattern
+    text = re.sub(r'\(\?s\)', '', text)
+    text = re.sub(r'\\b', '', text)
+    text = re.sub(r'\\s\+', ' ', text)
+    text = text.replace('\\s', ' ')
+    text = text.replace('\\n', ' ')
+    text = text.replace('\\t', ' ')
+    text = text.replace('\\', '')
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def _band_text(rule_name: str, target: str, pattern: str) -> str:
+    bands = _region_lookup.get((rule_name, target, pattern))
+    if not bands:
+        return ""
+    segments = []
+    for start, end in bands:
+        segments.append(f"[{start:.3f} - {end:.3f}]")
+    return " " + " ".join(segments)
+
+for rule in rules:
+    name = rule.get("name", "<unnamed>")
+    scope = rule.get("scope", "single_page")
+    print(f"=== {name} ({scope}) ===")
+
+    start = rule.get("start") or {}
+    if start.get("any_cues"):
+        print(" Start cues:")
+        for pat in start["any_cues"]:
+            print("   •", _pretty(pat) + _band_text(name, "start.any_cues", pat))
+
+    if start.get("helpful_cues"):
+        print(" Start helper cues:")
+        for pat in start["helpful_cues"]:
+            print("   •", _pretty(pat) + _band_text(name, "start.helpful_cues", pat))
+
+    if rule.get("require_any"):
+        print(" Require cues:")
+        for pat in rule["require_any"]:
+            print("   •", _pretty(pat) + _band_text(name, "require_any", pat))
+
+    if rule.get("helpful_cues"):
+        print(" Helper cues:")
+        for pat in rule["helpful_cues"]:
+            print("   •", _pretty(pat) + _band_text(name, "helpful_cues", pat))
+
+    end = rule.get("end") or {}
+    if end.get("first_cue"):
+        print(" End cues:")
+        for pat in end["first_cue"]:
+            print("   •", _pretty(pat) + _band_text(name, "end.first_cue", pat))
+
+    if end.get("helpful_cues"):
+        print(" End helper cues:")
+        for pat in end["helpful_cues"]:
+            print("   •", _pretty(pat) + _band_text(name, "end.helpful_cues", pat))
+
+    if end.get("fallback_cues"):
+        print(" End fallback cues:")
+        for pat in end["fallback_cues"]:
+            print("   •", _pretty(pat))
+
+    print()
