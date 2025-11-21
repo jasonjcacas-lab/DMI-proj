@@ -245,6 +245,22 @@ def _find_chrome_executable():
     return None
 
 
+def _get_chrome_user_data_dir():
+    """Get the Chrome user data directory for the current user."""
+    if os.name == 'nt':  # Windows
+        user_data_dir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Google', 'Chrome', 'User Data')
+    else:  # macOS/Linux
+        if os.name == 'posix':
+            home = os.environ.get('HOME', '')
+            if sys.platform == 'darwin':  # macOS
+                user_data_dir = os.path.join(home, 'Library', 'Application Support', 'Google', 'Chrome')
+            else:  # Linux
+                user_data_dir = os.path.join(home, '.config', 'google-chrome')
+        else:
+            user_data_dir = None
+    return user_data_dir if user_data_dir and os.path.exists(user_data_dir) else None
+
+
 def _extract_text_from_pdf(pdf_path: str) -> str:
     """Fast extraction for text-based PDFs using PyMuPDF."""
     if not fitz:
@@ -439,6 +455,6 @@ __all__ = [
     '_IMPORT_ERRORS', '_SIZE_PRESETS', '_DEFAULT_UI_SETTINGS', '_DEFAULT_MVR_SETTINGS',
     '_load_mvr_settings', '_save_mvr_settings', '_load_ui_settings', '_save_ui_settings',
     '_apply_display_size', '_is_port_open', '_is_chrome_running', '_find_chrome_executable',
-    '_extract_text_from_pdf', '_parse_mvr_fields', 'format_dob_value', 'DND_FILES'
+    '_get_chrome_user_data_dir', '_extract_text_from_pdf', '_parse_mvr_fields', 'format_dob_value', 'DND_FILES'
 ]
 
