@@ -1756,11 +1756,11 @@ def build_tab(parent):
         else:
             row(fields_frame, label, fields[key], key)
     
-    # Status function for compatibility
+    # Status function placeholder (will be redefined later with status label)
     def set_status(msg: str):
-        # Status messages not displayed in Copy-Paste mode
+        """Placeholder - will be updated when status label is created"""
         pass
-
+    
     def get_selected_file():
         """Get the currently selected file from the listbox or stored selection"""
         nonlocal current_selected_file
@@ -1908,47 +1908,126 @@ def build_tab(parent):
             except Exception:
                 pass
 
-    def on_fill():
-        url = url_var.get().strip()
-        if not url:
-            messagebox.showwarning("Missing URL", "Enter a target URL.")
+    def run_mvrs():
+        """Run MVR automation for all files - auto-extracts if needed"""
+        if not pdf_files:
+            messagebox.showwarning("No Files", "Please add MVR files first.")
             return
-        # Build data dict from fields
-        data = {k: v.get().strip() for k, v in fields.items()}
-        selectors = {k: v.get().strip() for k, v in sel_vars.items()}
+        
+        # Get login credentials
+        account_id = account_id_var.get().strip()
+        user_id = user_id_var.get().strip()
+        password = password_var.get().strip()
+        
+        if not account_id or not user_id or not password:
+            messagebox.showwarning("Missing Login", "Please configure Login Settings first.")
+            return
+        
+        url = url_var.get().strip()
+        if not url or url == "https://example.com/":
+            messagebox.showwarning("Missing URL", "Please configure Site Automation Settings first.")
+            return
+        
         def work():
             try:
-                set_status("Checking Playwright...")
+                set_status("Extracting data from all MVR files...")
                 _ensure_playwright_browsers_installed(set_status)
-                cdp_endpoint = None
-                if use_existing_var.get():
-                    port_str = (debug_port_var.get() or "").strip()
+                
+                # Auto-extract data for all files that don't have data yet
+                files_to_process = []
+                for filepath in pdf_files:
+                    if filepath not in file_data:
+                        # Extract data for this file
+                        try:
+                            set_status(f"Extracting: {os.path.basename(filepath)}...")
+                            text = _extract_text_from_pdf(filepath)
+                            parsed = _parse_mvr_fields(text)
+                            # Format DOB
+                            if "dob" in parsed:
+                                parsed["dob"] = format_dob_value(parsed["dob"])
+                            # Save to file_data
+                            file_data[filepath] = {
+                                "license_number": parsed.get("license_number", ""),
+                                "last_name": parsed.get("last_name", ""),
+                                "first_name": parsed.get("first_name", ""),
+                                "dob": parsed.get("dob", "").replace("_", ""),  # Clean DOB
+                                "state": parsed.get("state", ""),
+                                "extracted_text": text
+                            }
+                        except Exception as e:
+                            set_status(f"Error extracting {os.path.basename(filepath)}: {str(e)}")
+                            continue
+                    
+                    # Add to processing list if we have valid data
+                    if filepath in file_data:
+                        data = file_data[filepath]
+                        # Check if we have at least some data
+                        if any(data.get(k, "") for k in ["license_number", "last_name", "first_name", "dob", "state"]):
+                            files_to_process.append(filepath)
+                
+                if not files_to_process:
+                    messagebox.showwarning("No Data", "Could not extract data from any files.")
+                    set_status("No data extracted")
+                    return
+                
+                set_status(f"Processing {len(files_to_process)} file(s)...")
+                
+                selectors = {k: v.get().strip() for k, v in sel_vars.items()}
+                login_selectors_dict = {
+                    "account_id": login_sel_vars["account_id"].get().strip(),
+                    "user_id": login_sel_vars["user_id"].get().strip(),
+                    "password": login_sel_vars["password"].get().strip(),
+                }
+                
+                # Process all files sequentially
+                for idx, filepath in enumerate(files_to_process, 1):
+                    set_status(f"Processing file {idx}/{len(files_to_process)}: {os.path.basename(filepath)}...")
+                    data = file_data[filepath]
+                    # Run automation with login (only login once on first file)
                     try:
-                        port = int(port_str)
-                    except Exception:
-                        port = 9222
-                    # Note: existing Chrome must be started with --remote-debugging-port=PORT
-                    if _is_chrome_running():
-                        if _is_port_open("127.0.0.1", port):
-                            cdp_endpoint = f"http://127.0.0.1:{port}"
-                            set_status(f"Trying to attach to Chrome on {cdp_endpoint}...")
-                        else:
-                            set_status(f"Chrome running, but port {port} not open. Will launch new instance.")
-                    else:
-                        set_status("No Chrome detected. Will launch a new instance.")
-                else:
-                    set_status("Launching new Chromium instance...")
-                _fill_site_with_playwright(url, selectors, data, set_status, cdp_endpoint=cdp_endpoint)
-                set_status("Automation complete")
+                        _run_mvr_automation(
+                            url, selectors, data, account_id, user_id, password, 
+                            set_status, cdp_endpoint=None, 
+                            skip_login=(idx > 1),  # Skip login after first file
+                            login_selectors=login_selectors_dict if any(login_selectors_dict.values()) else None,
+                            auto_click_recaptcha=auto_click_recaptcha_var.get()
+                        )
+                    except Exception as automation_error:
+                        error_msg = str(automation_error)
+                        set_status(f"Automation error: {error_msg}")
+                        # For errors, continue or show error
+                        if "timeout" not in error_msg.lower() and "closed" not in error_msg.lower():
+                            messagebox.showerror("Automation Error", error_msg)
+                        raise  # Re-raise to be caught by outer exception handler
+                    # Small delay between files
+                    if idx < len(files_to_process):
+                        import time
+                        time.sleep(1)
+                
+                set_status(f"Completed processing {len(files_to_process)} file(s)")
+                messagebox.showinfo("Complete", f"Successfully processed {len(files_to_process)} file(s).")
             except Exception as e:
                 set_status("Error during automation")
                 messagebox.showerror("Automation Error", str(e))
         threading.Thread(target=work, daemon=True).start()
     
-    # Bottom section: Run/Fill button (created after on_fill is defined)
+    # Bottom section: Status label and Run button
     bottom_frame = ttk.Frame(right)
     bottom_frame.grid(row=2, column=0, sticky="ew", padx=0, pady=(10, 0))
-    right.grid_rowconfigure(2, weight=0, minsize=50)  # Minimum height for button
+    right.grid_rowconfigure(2, weight=0, minsize=80)  # Minimum height for status + button
+    
+    # Status label for displaying progress messages
+    status_label = ttk.Label(bottom_frame, text="Ready", foreground="gray", font=("Segoe UI", 9))
+    status_label.pack(fill="x", padx=5, pady=(0, 5))
+    
+    # Update set_status to use the status label
+    def set_status(msg: str):
+        """Update the status label with the given message"""
+        try:
+            # Update from main thread (thread-safe)
+            outer.after(0, lambda m=msg: status_label.config(text=m))
+        except Exception:
+            pass
     
     # Run/Fill button frame
     run_btn_frame = ttk.Frame(bottom_frame)
@@ -1970,15 +2049,15 @@ def build_tab(parent):
             padding_scale = button_padding / base_padding if base_padding > 0 else 1.0
             combined_scale = font_scale * (1.0 + (padding_scale - 1.0) * 0.3)
             
-            text_length = len("Fill Site")
+            text_length = len("Run Mvr's")
             scaled_width = int(text_length * combined_scale * 1.5)  # Extra space for padding
             scaled_width = max(scaled_width, text_length + 4)
             run_btn.configure(width=scaled_width)
         except Exception:
             pass
     
-    # Create Run/Fill button (now on_fill is defined)
-    run_btn = ttk.Button(run_btn_frame, text="Fill Site", command=on_fill, width=20)
+    # Create Run Mvr's button (now run_mvrs is defined)
+    run_btn = ttk.Button(run_btn_frame, text="Run Mvr's", command=run_mvrs, width=20)
     run_btn.pack()
     
     # Initial button width setup
