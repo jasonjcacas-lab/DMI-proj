@@ -466,6 +466,14 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
         "DISTRICT OF COLUMBIA": "DC", "WASHINGTON DC": "DC", "DC": "DC"
     }
     
+    # Reverse mapping from abbreviations to full state names (for output)
+    # Prioritize full state names over shorter variants (e.g., "DISTRICT OF COLUMBIA" over "DC")
+    abbrev_to_state_name = {}
+    for name, abbrev in state_name_to_abbrev.items():
+        # Only update if we don't have a mapping yet, or if the new name is longer (more specific)
+        if abbrev not in abbrev_to_state_name or len(name) > len(abbrev_to_state_name[abbrev]):
+            abbrev_to_state_name[abbrev] = name
+    
     for pat, group_idx in state_patterns:
         m = re.search(pat, text, re.MULTILINE)
         if m:
@@ -475,13 +483,25 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
             # Clean up the state candidate - remove extra whitespace
             state_candidate_upper = re.sub(r'\s+', ' ', state_candidate_upper)
             
-            # If it's a 2-letter code, verify it's a valid state
+            # If it's a 2-letter code, verify it's a valid state and convert to full name
             if len(state_candidate_upper) == 2 and state_candidate_upper in us_states_abbrev:
-                results["state"] = state_candidate_upper
+                # Convert abbreviation to full state name for output
+                full_name = abbrev_to_state_name.get(state_candidate_upper)
+                if full_name:
+                    results["state"] = full_name
+                else:
+                    # Fallback: if reverse mapping failed, try to find it manually
+                    for name, abbrev in state_name_to_abbrev.items():
+                        if abbrev == state_candidate_upper:
+                            results["state"] = name
+                            break
+                    else:
+                        # Last resort: keep abbreviation (shouldn't happen)
+                        results["state"] = state_candidate_upper
                 break
-            # If it's a full state name, convert to abbreviation
+            # If it's a full state name, use it directly (normalize to uppercase key format)
             elif state_candidate_upper in state_name_to_abbrev:
-                results["state"] = state_name_to_abbrev[state_candidate_upper]
+                results["state"] = state_candidate_upper
                 break
             # Try exact match first (for multi-word states like "NEW YORK")
             else:
@@ -489,7 +509,7 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
                 matched = False
                 for state_name, abbrev in state_name_to_abbrev.items():
                     if state_candidate_upper == state_name:
-                        results["state"] = abbrev
+                        results["state"] = state_name
                         matched = True
                         break
                 
@@ -501,13 +521,20 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
                         if state_name.startswith(state_candidate_upper) or state_candidate_upper in state_name:
                             # Make sure it's a reasonable match (not too short)
                             if len(state_candidate_upper) >= 3:  # At least 3 characters to avoid false matches
-                                results["state"] = abbrev
+                                results["state"] = state_name
                                 matched = True
                                 break
                 
                 if matched:
                     break
                 break
+    
+    # Final conversion: if we somehow ended up with an abbreviation, convert it to full name
+    if "state" in results and results["state"]:
+        state_value = results["state"].upper().strip()
+        # Check if it's a 2-letter abbreviation
+        if len(state_value) == 2 and state_value in abbrev_to_state_name:
+            results["state"] = abbrev_to_state_name[state_value]
     
     return results
 
@@ -1118,13 +1145,96 @@ def build_tab(parent):
     pdf_listbox.config(yscrollcommand=scrollbar.set)
     
     # Store file paths (list of full paths, indexed by listbox position)
-    pdf_files = []  # List of full file paths
+    pdf_files = []  # List of full file paths or manual entry identifiers (starting with "MANUAL:")
     
     # Store extracted/edited data per file: {filepath: {license_number: "", last_name: "", first_name: "", dob: "", state: ""}}
-    file_data = {}  # Dictionary mapping file paths to their extracted/edited data
+    file_data = {}  # Dictionary mapping file paths (or manual identifiers) to their extracted/edited data
     
     # Store currently selected file path (persists even when listbox loses focus)
     current_selected_file = None
+    
+    # Expose callback function for external tools (like OllamaTool) to add MVR entries
+    def add_mvr_entry_from_external(mvr_data: Dict[str, str], source: str = "AI"):
+        """Add an MVR entry from an external source (e.g., Ollama AI extraction)"""
+        nonlocal file_data, pdf_files, current_selected_file
+        
+        # Normalize the data
+        new_data = {
+            "license_number": mvr_data.get("license_number", "").strip(),
+            "last_name": mvr_data.get("last_name", "").strip(),
+            "first_name": mvr_data.get("first_name", "").strip(),
+            "dob": mvr_data.get("dob", "").strip().replace("_", ""),
+            "state": mvr_data.get("state", "").strip(),
+            "extracted_text": mvr_data.get("extracted_text", "")
+        }
+        
+        # Check if all fields are empty
+        if not any(new_data.get(k, "") for k in ["license_number", "last_name", "first_name", "dob", "state"]):
+            return False, "No MVR data provided"
+        
+        # Check for duplicate
+        duplicate_id = check_duplicate_mvr_data(new_data)
+        if duplicate_id:
+            return False, "Duplicate entry already exists"
+        
+        # Create a unique identifier
+        import time
+        timestamp = int(time.time())
+        license_part = new_data["license_number"][:10] if new_data["license_number"] else "NONE"
+        last_part = new_data["last_name"][:15] if new_data["last_name"] else "NONE"
+        first_part = new_data["first_name"][:10] if new_data["first_name"] else "NONE"
+        
+        # Create display name
+        display_parts = []
+        if new_data["license_number"]:
+            display_parts.append(f"License: {new_data['license_number'][:10]}")
+        if new_data["last_name"]:
+            display_parts.append(f"{new_data['last_name'][:15]}")
+        if new_data["first_name"]:
+            display_parts.append(f"{new_data['first_name'][:10]}")
+        display_name = " - ".join(display_parts) if display_parts else f"{source} Entry"
+        manual_id = f"MANUAL:{license_part}_{last_part}_{first_part}_{timestamp}"
+        
+        # Add to files list and save data
+        pdf_files.append(manual_id)
+        file_data[manual_id] = new_data
+        file_data[manual_id]["_display_name"] = display_name
+        file_data[manual_id]["_source"] = source
+        
+        # Update listbox display
+        update_listbox_display()
+        
+        # Select the newly added entry
+        if pdf_files:
+            idx = len(pdf_files) - 1
+            pdf_listbox.selection_clear(0, tk.END)
+            pdf_listbox.selection_set(idx)
+            pdf_listbox.see(idx)
+            current_selected_file = manual_id
+        
+        # Load the data into fields
+        fields["license_number"].delete(0, tk.END)
+        fields["license_number"].insert(0, new_data["license_number"])
+        fields["last_name"].delete(0, tk.END)
+        fields["last_name"].insert(0, new_data["last_name"])
+        fields["first_name"].delete(0, tk.END)
+        fields["first_name"].insert(0, new_data["first_name"])
+        fields["dob"].delete(0, tk.END)
+        fields["dob"].insert(0, new_data["dob"])
+        fields["state"].delete(0, tk.END)
+        fields["state"].insert(0, new_data["state"])
+        if "extracted_text" in new_data and new_data["extracted_text"]:
+            txt.delete("1.0", tk.END)
+            txt.insert("1.0", new_data["extracted_text"])
+        
+        return True, f"MVR entry added from {source}"
+    
+    # Store the callback in a module-level variable for external access
+    # This allows OllamaTool to call it
+    import sys
+    if 'Tabs.MvrRunner' not in sys.modules:
+        sys.modules['Tabs.MvrRunner'] = sys.modules[__name__]
+    sys.modules['Tabs.MvrRunner']._add_mvr_entry_callback = add_mvr_entry_from_external
     
     # Initialize listbox with empty message
     pdf_listbox.insert(tk.END, "(No files - drag & drop or click 'Add Files...')")
@@ -1134,8 +1244,31 @@ def build_tab(parent):
         pdf_listbox.delete(0, tk.END)
         if pdf_files:
             for i, filepath in enumerate(pdf_files):
-                filename = os.path.basename(filepath)
-                pdf_listbox.insert(tk.END, f"{i+1}. {filename}")
+                if filepath.startswith("MANUAL:"):
+                    # Manual entry - get display name from file_data if available
+                    if filepath in file_data:
+                        data = file_data[filepath]
+                        # Use stored display name if available, otherwise generate it
+                        if "_display_name" in data:
+                            display_name = data["_display_name"]
+                        else:
+                            display_parts = []
+                            if data.get("license_number"):
+                                display_parts.append(f"License: {data['license_number'][:10]}")
+                            if data.get("last_name"):
+                                display_parts.append(data["last_name"][:15])
+                            if data.get("first_name"):
+                                display_parts.append(data["first_name"][:10])
+                            # Add position if available
+                            if data.get("position"):
+                                display_parts.append(f"({data['position'][:10]})")
+                            display_name = " - ".join(display_parts) if display_parts else "Manual Entry"
+                    else:
+                        display_name = "Manual Entry"
+                    pdf_listbox.insert(tk.END, f"{i+1}. {display_name}")
+                else:
+                    filename = os.path.basename(filepath)
+                    pdf_listbox.insert(tk.END, f"{i+1}. {filename}")
         else:
             # Always show at least one row, even if empty
             pdf_listbox.insert(tk.END, "(No files - drag & drop or click 'Add Files...')")
@@ -1180,6 +1313,33 @@ def build_tab(parent):
                 # Clear fields if this was the selected file
                 clear_fields()
     
+    def normalize_mvr_data(data):
+        """Normalize MVR data for comparison (case-insensitive, trimmed)"""
+        return {
+            "license_number": (data.get("license_number", "") or "").strip().upper(),
+            "last_name": (data.get("last_name", "") or "").strip().upper(),
+            "first_name": (data.get("first_name", "") or "").strip().upper(),
+            "dob": (data.get("dob", "") or "").strip().replace("_", "").replace("/", "").replace("-", ""),
+            "state": (data.get("state", "") or "").strip().upper()
+        }
+    
+    def mvr_data_matches(data1, data2):
+        """Check if two MVR data dictionaries match (all fields identical)"""
+        norm1 = normalize_mvr_data(data1)
+        norm2 = normalize_mvr_data(data2)
+        return (norm1["license_number"] == norm2["license_number"] and
+                norm1["last_name"] == norm2["last_name"] and
+                norm1["first_name"] == norm2["first_name"] and
+                norm1["dob"] == norm2["dob"] and
+                norm1["state"] == norm2["state"])
+    
+    def check_duplicate_mvr_data(new_data):
+        """Check if the given MVR data already exists in file_data"""
+        for existing_id, existing_data in file_data.items():
+            if mvr_data_matches(new_data, existing_data):
+                return existing_id
+        return None
+    
     def clear_all_files():
         """Clear all files from the list"""
         nonlocal current_selected_file
@@ -1209,12 +1369,52 @@ def build_tab(parent):
                     # Format DOB when loading
                     dob_value = data.get(key, "")
                     var.set(format_dob_value(dob_value))
+                elif key == "state":
+                    # Convert state abbreviation to full name if needed (for backward compatibility)
+                    state_value = data.get(key, "").strip().upper()
+                    if state_value and len(state_value) == 2:
+                        # It's likely an abbreviation - try to convert to full name
+                        abbrev_to_full = {
+                            "AL": "ALABAMA", "AK": "ALASKA", "AZ": "ARIZONA", "AR": "ARKANSAS", "CA": "CALIFORNIA",
+                            "CO": "COLORADO", "CT": "CONNECTICUT", "DE": "DELAWARE", "FL": "FLORIDA", "GA": "GEORGIA",
+                            "HI": "HAWAII", "ID": "IDAHO", "IL": "ILLINOIS", "IN": "INDIANA", "IA": "IOWA",
+                            "KS": "KANSAS", "KY": "KENTUCKY", "LA": "LOUISIANA", "ME": "MAINE", "MD": "MARYLAND",
+                            "MA": "MASSACHUSETTS", "MI": "MICHIGAN", "MN": "MINNESOTA", "MS": "MISSISSIPPI", "MO": "MISSOURI",
+                            "MT": "MONTANA", "NE": "NEBRASKA", "NV": "NEVADA", "NH": "NEW HAMPSHIRE", "NJ": "NEW JERSEY",
+                            "NM": "NEW MEXICO", "NY": "NEW YORK", "NC": "NORTH CAROLINA", "ND": "NORTH DAKOTA", "OH": "OHIO",
+                            "OK": "OKLAHOMA", "OR": "OREGON", "PA": "PENNSYLVANIA", "RI": "RHODE ISLAND", "SC": "SOUTH CAROLINA",
+                            "SD": "SOUTH DAKOTA", "TN": "TENNESSEE", "TX": "TEXAS", "UT": "UTAH", "VT": "VERMONT",
+                            "VA": "VIRGINIA", "WA": "WASHINGTON", "WV": "WEST VIRGINIA", "WI": "WISCONSIN", "WY": "WYOMING",
+                            "DC": "DISTRICT OF COLUMBIA"
+                        }
+                        full_name = abbrev_to_full.get(state_value)
+                        if full_name:
+                            var.set(full_name)
+                        else:
+                            var.set(data.get(key, ""))
+                    else:
+                        var.set(data.get(key, ""))
                 else:
                     var.set(data.get(key, ""))
             # Also load extracted text if available
             if "extracted_text" in data:
                 txt.delete("1.0", "end")
                 txt.insert("1.0", data["extracted_text"])
+            
+            # Show position and status in extracted text if available (from dealer app)
+            if data.get("position") or data.get("status"):
+                info_lines = []
+                if data.get("position"):
+                    info_lines.append(f"Position: {data['position']}")
+                if data.get("status"):
+                    info_lines.append(f"Status: {data['status']}")
+                if info_lines:
+                    # Append to extracted text if it exists, otherwise set it
+                    current_text = txt.get("1.0", "end-1c").strip()
+                    if current_text:
+                        txt.insert("end", "\n\n" + "\n".join(info_lines))
+                    else:
+                        txt.insert("1.0", "\n".join(info_lines))
         else:
             clear_fields()
     
@@ -1223,6 +1423,11 @@ def build_tab(parent):
         if filepath:
             # Clean DOB - remove underscores, keep digits and slashes
             dob_value = fields["dob"].get().strip().replace("_", "")
+            # Preserve display name for manual entries
+            old_display_name = None
+            if filepath.startswith("MANUAL:") and filepath in file_data:
+                old_display_name = file_data[filepath].get("_display_name")
+            
             file_data[filepath] = {
                 "license_number": fields["license_number"].get().strip(),
                 "last_name": fields["last_name"].get().strip(),
@@ -1231,6 +1436,24 @@ def build_tab(parent):
                 "state": fields["state"].get().strip(),
                 "extracted_text": txt.get("1.0", "end-1c")
             }
+            
+            # Restore or update display name for manual entries
+            if filepath.startswith("MANUAL:"):
+                if old_display_name:
+                    file_data[filepath]["_display_name"] = old_display_name
+                else:
+                    # Generate new display name if not present
+                    data = file_data[filepath]
+                    display_parts = []
+                    if data.get("license_number"):
+                        display_parts.append(f"License: {data['license_number'][:10]}")
+                    if data.get("last_name"):
+                        display_parts.append(data["last_name"][:15])
+                    if data.get("first_name"):
+                        display_parts.append(data["first_name"][:10])
+                    file_data[filepath]["_display_name"] = " - ".join(display_parts) if display_parts else "Manual Entry"
+                # Update listbox display to reflect changes
+                update_listbox_display()
     
     # File management buttons (always visible, not shrinkable) - directly below the list frame
     file_btn_frame = ttk.Frame(file_section_frame)
@@ -1756,6 +1979,79 @@ def build_tab(parent):
         else:
             row(fields_frame, label, fields[key], key)
     
+    # Save as MVR button (for manually entered data)
+    save_mvr_btn_frame = ttk.Frame(fields_container)
+    save_mvr_btn_frame.grid(row=2, column=0, sticky="ew", padx=0, pady=(10, 0))
+    fields_container.grid_rowconfigure(2, weight=0)  # Button row doesn't expand
+    
+    def on_save_as_mvr():
+        """Save manually entered fields as a new MVR entry"""
+        # Get current field values
+        dob_value = fields["dob"].get().strip().replace("_", "")
+        new_data = {
+            "license_number": fields["license_number"].get().strip(),
+            "last_name": fields["last_name"].get().strip(),
+            "first_name": fields["first_name"].get().strip(),
+            "dob": dob_value,
+            "state": fields["state"].get().strip(),
+            "extracted_text": txt.get("1.0", "end-1c")
+        }
+        
+        # Check if all fields are empty
+        if not any(new_data.get(k, "") for k in ["license_number", "last_name", "first_name", "dob", "state"]):
+            messagebox.showwarning("Empty Fields", "Please enter at least one field before saving.")
+            return
+        
+        # Check for duplicate
+        duplicate_id = check_duplicate_mvr_data(new_data)
+        if duplicate_id:
+            messagebox.showwarning("Duplicate Entry", "This MVR file already exists.")
+            set_status("Duplicate entry - not saved")
+            return
+        
+        # Create a unique identifier for this manual entry
+        # Use license + last name + first name for display, with timestamp for uniqueness
+        import time
+        timestamp = int(time.time())
+        license_part = new_data["license_number"][:10] if new_data["license_number"] else "NONE"
+        last_part = new_data["last_name"][:15] if new_data["last_name"] else "NONE"
+        first_part = new_data["first_name"][:10] if new_data["first_name"] else "NONE"
+        # Create a readable display name
+        display_parts = []
+        if new_data["license_number"]:
+            display_parts.append(f"License: {new_data['license_number'][:10]}")
+        if new_data["last_name"]:
+            display_parts.append(f"{new_data['last_name'][:15]}")
+        if new_data["first_name"]:
+            display_parts.append(f"{new_data['first_name'][:10]}")
+        display_name = " - ".join(display_parts) if display_parts else "Manual Entry"
+        manual_id = f"MANUAL:{license_part}_{last_part}_{first_part}_{timestamp}"
+        
+        # Add to files list and save data
+        pdf_files.append(manual_id)
+        file_data[manual_id] = new_data
+        
+        # Store display name in file_data for easy retrieval
+        file_data[manual_id]["_display_name"] = display_name
+        
+        # Update listbox display
+        update_listbox_display()
+        
+        # Select the newly added entry
+        if pdf_files:
+            idx = len(pdf_files) - 1
+            pdf_listbox.selection_clear(0, tk.END)
+            pdf_listbox.selection_set(idx)
+            pdf_listbox.see(idx)
+            nonlocal current_selected_file
+            current_selected_file = manual_id
+        
+        set_status("MVR entry saved successfully")
+        messagebox.showinfo("Saved", "MVR entry has been saved and added to the list.")
+    
+    save_mvr_btn = ttk.Button(save_mvr_btn_frame, text="Save as MVR", command=on_save_as_mvr, width=15)
+    save_mvr_btn.pack(side="left", padx=(0, 5))
+    
     # Status function placeholder (will be redefined later with status label)
     def set_status(msg: str):
         """Placeholder - will be updated when status label is created"""
@@ -1777,8 +2073,15 @@ def build_tab(parent):
     
     def on_extract():
         p = get_selected_file()
-        if not p or not os.path.isfile(p):
+        if not p:
             messagebox.showwarning("No File Selected", "Please select a file from the list above.")
+            return
+        # Skip extraction for manual entries (they already have data)
+        if p.startswith("MANUAL:"):
+            messagebox.showinfo("Manual Entry", "This is a manually entered MVR entry. Data is already loaded.")
+            return
+        if not os.path.isfile(p):
+            messagebox.showwarning("File Not Found", "The selected file no longer exists.")
             return
         def work():
             try:
@@ -1806,8 +2109,18 @@ def build_tab(parent):
     def on_save():
         """Save current field values for the selected file"""
         p = get_selected_file()
-        if not p or not os.path.isfile(p):
+        if not p:
             messagebox.showwarning("No File Selected", "Please select a file from the list above.")
+            return
+        # For manual entries, just update the data
+        if p.startswith("MANUAL:"):
+            save_file_data(p)
+            set_status("Data saved for this MVR entry")
+            messagebox.showinfo("Saved", "Data has been saved for this MVR entry.")
+            return
+        # For PDF files, check if file exists
+        if not os.path.isfile(p):
+            messagebox.showwarning("File Not Found", "The selected file no longer exists.")
             return
         
         save_file_data(p)
@@ -1936,6 +2249,15 @@ def build_tab(parent):
                 # Auto-extract data for all files that don't have data yet
                 files_to_process = []
                 for filepath in pdf_files:
+                    # Skip extraction for manual entries (they already have data)
+                    if filepath.startswith("MANUAL:"):
+                        # Manual entry - check if it has data
+                        if filepath in file_data:
+                            data = file_data[filepath]
+                            if any(data.get(k, "") for k in ["license_number", "last_name", "first_name", "dob", "state"]):
+                                files_to_process.append(filepath)
+                        continue
+                    
                     if filepath not in file_data:
                         # Extract data for this file
                         try:
@@ -1981,7 +2303,12 @@ def build_tab(parent):
                 
                 # Process all files sequentially
                 for idx, filepath in enumerate(files_to_process, 1):
-                    set_status(f"Processing file {idx}/{len(files_to_process)}: {os.path.basename(filepath)}...")
+                    # Get display name for manual entries vs PDF files
+                    if filepath.startswith("MANUAL:"):
+                        display_name = filepath.replace("MANUAL:", "Manual Entry")
+                    else:
+                        display_name = os.path.basename(filepath)
+                    set_status(f"Processing file {idx}/{len(files_to_process)}: {display_name}...")
                     data = file_data[filepath]
                     # Run automation with login (only login once on first file)
                     try:
@@ -2074,12 +2401,22 @@ def build_tab(parent):
         if not p:
             return
         
+        # Manual entries always have data, just load it
+        if p.startswith("MANUAL:"):
+            if p in file_data:
+                load_file_data(p)
+                set_status("Loaded manual MVR entry")
+            return
+        
         if p in file_data:
             # File has saved data, load it
             load_file_data(p)
             set_status("Loaded saved data for selected file")
         else:
-            # No saved data, auto-extract
+            # No saved data, auto-extract (only for PDF files)
+            if not os.path.isfile(p):
+                set_status("File not found")
+                return
             def work():
                 try:
                     set_status("Auto-extracting...")

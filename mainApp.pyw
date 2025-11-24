@@ -165,26 +165,26 @@ def main():
             except Exception:
                 pass
 
-    # Add Future Tool tab (optional if module exists)
+    # Add Ollama AI Tool tab (optional if module exists)
     try:
-        from Tabs import FutureTool  # type: ignore
-        future_tab = FutureTool.build_tab(notebook)
-        notebook.add(future_tab, text="Future Tool")
+        from Tabs import OllamaTool  # type: ignore
+        ollama_tab = OllamaTool.build_tab(notebook)
+        notebook.add(ollama_tab, text="Ollama AI")
     except Exception as e:
         # Fallback: try to load directly from file path
         try:
-            future_path = os.path.join(APP_DIR, "Tabs", "FutureTool.py")
-            if os.path.isfile(future_path):
-                spec = importlib.util.spec_from_file_location("Tabs.FutureTool", future_path)
-                future_mod = importlib.util.module_from_spec(spec)  # type: ignore
+            ollama_path = os.path.join(APP_DIR, "Tabs", "OllamaTool.py")
+            if os.path.isfile(ollama_path):
+                spec = importlib.util.spec_from_file_location("Tabs.OllamaTool", ollama_path)
+                ollama_mod = importlib.util.module_from_spec(spec)  # type: ignore
                 assert spec is not None and spec.loader is not None
-                spec.loader.exec_module(future_mod)  # type: ignore
-                future_tab = future_mod.build_tab(notebook)  # type: ignore
-                notebook.add(future_tab, text="Future Tool")
+                spec.loader.exec_module(ollama_mod)  # type: ignore
+                ollama_tab = ollama_mod.build_tab(notebook)  # type: ignore
+                notebook.add(ollama_tab, text="Ollama AI")
         except Exception as e2:
             # Silently fail for optional tab
             try:
-                sys.stderr.write(f"Future Tool tab not available: {e}\n")
+                sys.stderr.write(f"Ollama AI tab not available: {e}\n")
             except Exception:
                 pass
 
