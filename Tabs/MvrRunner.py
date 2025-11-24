@@ -1204,12 +1204,13 @@ def build_tab(parent):
         # Update listbox display
         update_listbox_display()
         
-        # Select the newly added entry
+        # Scroll to top and select the newly added entry
         if pdf_files:
             idx = len(pdf_files) - 1
             pdf_listbox.selection_clear(0, tk.END)
             pdf_listbox.selection_set(idx)
-            pdf_listbox.see(idx)
+            # Scroll to top (index 0) so user can see all entries from the beginning
+            pdf_listbox.see(0)
             current_selected_file = manual_id
         
         # Load the data into fields
@@ -1235,6 +1236,16 @@ def build_tab(parent):
     if 'Tabs.MvrRunner' not in sys.modules:
         sys.modules['Tabs.MvrRunner'] = sys.modules[__name__]
     sys.modules['Tabs.MvrRunner']._add_mvr_entry_callback = add_mvr_entry_from_external
+    
+    def scroll_listbox_to_top():
+        """Scroll the MVR listbox to the top"""
+        try:
+            if pdf_listbox.size() > 0:
+                pdf_listbox.see(0)
+        except Exception:
+            pass
+    
+    sys.modules['Tabs.MvrRunner']._scroll_listbox_to_top = scroll_listbox_to_top
     
     # Initialize listbox with empty message
     pdf_listbox.insert(tk.END, "(No files - drag & drop or click 'Add Files...')")

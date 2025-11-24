@@ -127,7 +127,9 @@ def main():
     settings_menu = tk.Menu(menubar, tearoff=0)
     menubar.add_cascade(label="Settings", menu=settings_menu)
     if Splitter is not None and hasattr(Splitter, "show_ssa_settings_dialog"):
-        settings_menu.add_command(label="SSA Rule Selection...", command=lambda: Splitter.show_ssa_settings_dialog(root))
+        def show_ssa_dialog():
+            Splitter.show_ssa_settings_dialog(root)
+        settings_menu.add_command(label="SSA Rule Selection...", command=show_ssa_dialog)
 
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True)

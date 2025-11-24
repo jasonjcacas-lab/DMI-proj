@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import json
+import re
 from typing import Optional, List, Dict
 
 import tkinter as tk
@@ -30,17 +31,17 @@ except ImportError as e:
     _REQUESTS_ERROR = str(e)
 
 # Try to import OCR libraries
-_PADDLEOCR_AVAILABLE = False
+_EASYOCR_AVAILABLE = False
 _TESSERACT_AVAILABLE = False
 _PYMUPDF_AVAILABLE = False
 _PIL_AVAILABLE = False
 _PDFPLUMBER_AVAILABLE = False
 
 try:
-    from paddleocr import PaddleOCR
-    _PADDLEOCR_AVAILABLE = True
+    import easyocr
+    _EASYOCR_AVAILABLE = True
 except ImportError:
-    _PADDLEOCR_AVAILABLE = False
+    _EASYOCR_AVAILABLE = False
 
 try:
     import pytesseract
@@ -78,13 +79,159 @@ _DEFAULT_SETTINGS = {
     "temperature": 0.7,
     "top_p": 0.9,
     "max_tokens": 512,
-    "ocr_engine": "tesseract",  # "tesseract", "paddleocr", or "ollama_vision"
+    "ocr_engine": "tesseract",  # "tesseract", "easyocr", or "ollama_vision"
     "vision_model": "llava",  # Vision model for Ollama (llava, granit-vision, etc.)
 }
 
 # Ollama API state
 _ollama_available = False
 _available_models = []
+
+
+def _clean_ocr_text(text: str) -> str:
+    """Clean OCR text to fix common issues:
+    - Fix dates: 2/4/1999 → 02/04/1999
+    - Remove checkbox marks: EFT → FT, DPT → PT, XY → Y, XN → N
+    """
+    if not text:
+        return text
+    
+    import re
+    
+    # Fix dates: normalize MM/DD/YYYY format
+    # Pattern: one or two digits / one or two digits / four digits
+    # Examples: 2/4/1999 → 02/04/1999, 12/25/2000 → 12/25/2000
+    def fix_date(match):
+        month, day, year = match.groups()
+        # Validate year is 4 digits and reasonable (1900-2099)
+        if len(year) == 4 and 1900 <= int(year) <= 2099:
+            # Pad with zeros if single digit
+            month = month.zfill(2)
+            day = day.zfill(2)
+            return f"{month}/{day}/{year}"
+        return match.group(0)  # Return original if year is invalid
+    
+    # Fix dates where slashes are misread as "1" (e.g., "2111/2003" → "02/11/2003")
+    # Pattern: 3-4 digits, then /, then 4 digits (year)
+    # Examples: "2111/2003" → "02/11/2003", "1211/2003" → "12/11/2003", "211/2003" → "02/11/2003"
+    def fix_slash_as_one(match):
+        first_part = match.group(1)  # Could be "2111", "1211", "211", etc.
+        year = match.group(2)
+        
+        # Validate year is 4 digits and reasonable (1900-2099)
+        if len(year) != 4 or not (1900 <= int(year) <= 2099):
+            return match.group(0)  # Don't fix if year is invalid
+        
+        # Try to split first_part into month and day
+        # If 4 digits: first 1-2 digits = month, last 1-2 digits = day
+        # If 3 digits: first 1 digit = month, last 2 digits = day
+        if len(first_part) == 4:
+            # Try splitting as 1+2 (e.g., "2111" → "2" + "11")
+            if first_part[0] in '12' and 1 <= int(first_part[1:3]) <= 31:
+                month = first_part[0]
+                day = first_part[1:3]
+            # Try splitting as 2+2 (e.g., "1211" → "12" + "11")
+            elif 1 <= int(first_part[0:2]) <= 12 and 1 <= int(first_part[2:4]) <= 31:
+                month = first_part[0:2]
+                day = first_part[2:4]
+            else:
+                # Default: assume 1+2 split
+                month = first_part[0]
+                day = first_part[1:3]
+        elif len(first_part) == 3:
+            # Split as 1+2 (e.g., "211" → "2" + "11")
+            month = first_part[0]
+            day = first_part[1:3]
+        else:
+            # Can't fix, return original
+            return match.group(0)
+        
+        # Validate: month 1-12, day 1-31
+        if 1 <= int(month) <= 12 and 1 <= int(day) <= 31:
+            return f"{month.zfill(2)}/{day.zfill(2)}/{year}"
+        else:
+            return match.group(0)
+    
+    # IMPORTANT: Process dates in order of specificity to avoid false matches
+    # CRITICAL: We must avoid processing dates multiple times
+    # Strategy: Process dates in a single pass, most specific patterns first
+    
+    # First, fix dates where slash is misread as 1: "2111/2003" pattern
+    # This must come BEFORE the normal date fix to catch malformed dates first
+    # Only match if the year part looks like a valid 4-digit year (1900-2099)
+    text = re.sub(r'\b(\d{3,4})/(\d{4})\b', fix_slash_as_one, text)
+    
+    # Then fix normal dates with slashes (most common case: M/D/YYYY)
+    # Only process if year is valid (1900-2099) to avoid corrupting valid dates
+    # Use word boundaries to ensure we match complete dates, not parts
+    # CRITICAL: This pattern should match "2/4/1999" and convert to "02/04/1999"
+    # But we must ensure it doesn't match parts of already-processed dates
+    text = re.sub(r'\b(\d{1,2})/(\d{1,2})/(\d{4})\b', fix_date, text)
+    
+    # DO NOT process "missing slash" patterns - they cause double-processing
+    # If a date is already in M/D/YYYY format, the above pattern handles it
+    # The "missing slash" pattern was causing dates like "2/4/1999" to become "02/01/04/1999"
+    
+    # NOTE: We do NOT attempt to "correct" or modify years in any way.
+    # Years are passed through exactly as OCR reads them.
+    # We only normalize month/day padding (e.g., "2/4" → "02/04").
+    # If OCR misreads a year, that's an OCR accuracy issue, not something we should guess at.
+    
+    # Fix common OCR errors in state codes (2-letter abbreviations)
+    # OCR often misreads similar-looking characters in short text like "IL"
+    # This is especially problematic for "IL" where "I" looks like "1" and "L" looks like "1"
+    
+    # Comprehensive list of state code misreadings
+    state_corrections = {
+        # IL (Illinois) - most commonly misread, many variations
+        "1L": "IL",  # "I" misread as "1"
+        "I1": "IL",  # "L" misread as "1"
+        "|L": "IL",  # "I" misread as "|"
+        "|1": "IL",  # Both misread
+        "IL.": "IL",  # Extra period
+        "1l": "IL",  # Lowercase version
+        "i1": "IL",  # Lowercase version
+        "|l": "IL",  # Lowercase version
+        "1|": "IL",  # Alternative misreading
+        "|I": "IL",  # Alternative misreading
+        # Other common misreadings
+        "N1": "NY",  # "Y" misread as "1" (New York)
+        "C4": "CA",  # "A" misread as "4" (California)
+        "P4": "PA",  # "A" misread as "4" (Pennsylvania)
+        "F1": "FL",  # "L" misread as "1" (Florida)
+        "0H": "OH",  # "O" misread as "0" (Ohio)
+        "M1": "MI",  # "I" misread as "1" (Michigan)
+    }
+    
+    # Apply corrections for known OCR errors in state codes
+    # Use word boundaries and case-insensitive matching
+    # Apply multiple times to catch all variations
+    for wrong, correct in state_corrections.items():
+        # Match standalone codes (word boundaries)
+        text = re.sub(r'\b' + re.escape(wrong) + r'\b', correct, text, flags=re.IGNORECASE)
+        # Also match codes that might be part of "STATE" column context
+        # Look for patterns like "STATE 1L" or "State I1"
+        text = re.sub(r'\b(STATE|State)\s+' + re.escape(wrong) + r'\b', 
+                     r'\1 ' + correct, text, flags=re.IGNORECASE)
+    
+    # Clean checkbox marks from STATUS field (FT/PT)
+    # Patterns: XFT, EFT, DPT, XPT, etc. → FT or PT
+    # Look for FT or PT that might have a character before it (checkbox mark)
+    text = re.sub(r'\b[EXD]?FT\b', 'FT', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b[EXD]?PT\b', 'PT', text, flags=re.IGNORECASE)
+    # Also handle cases where checkbox is separate: "X FT" → "FT"
+    text = re.sub(r'\b[EXD]\s*FT\b', 'FT', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b[EXD]\s*PT\b', 'PT', text, flags=re.IGNORECASE)
+    
+    # Clean checkbox marks from PERSONAL USE field (Y/N)
+    # Patterns: XY, XN, EY, EN, etc. → Y or N
+    text = re.sub(r'\b[EXD]?Y\b(?=\s|$)', 'Y', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b[EXD]?N\b(?=\s|$)', 'N', text, flags=re.IGNORECASE)
+    # Handle cases where checkbox is separate: "X Y" → "Y"
+    text = re.sub(r'\b[EXD]\s*Y\b(?=\s|$)', 'Y', text, flags=re.IGNORECASE)
+    text = re.sub(r'\b[EXD]\s*N\b(?=\s|$)', 'N', text, flags=re.IGNORECASE)
+    
+    return text
 
 
 def _ensure_dir(path):
@@ -243,15 +390,15 @@ def _extract_text_with_tesseract(file_path: str) -> str:
         return f"Tesseract OCR error: {str(e)}"
 
 
-def _extract_text_with_paddleocr(file_path: str) -> str:
-    """Extract text from PDF or image using PaddleOCR"""
-    if not _PADDLEOCR_AVAILABLE:
+def _extract_text_with_easyocr(file_path: str) -> str:
+    """Extract text from PDF or image using EasyOCR"""
+    if not _EASYOCR_AVAILABLE:
         return None
     
     try:
         import numpy as np
-        # Initialize PaddleOCR (use_angle_cls=True for better accuracy)
-        ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False)
+        # Initialize EasyOCR reader (English, no GPU)
+        reader = easyocr.Reader(['en'], gpu=False)
         text_parts = []
         
         # Check if it's a PDF
@@ -267,13 +414,13 @@ def _extract_text_with_paddleocr(file_path: str) -> str:
                 if _PIL_AVAILABLE:
                     from io import BytesIO
                     img = Image.open(BytesIO(img_data))
-                    # Convert PIL image to numpy array for PaddleOCR
+                    # Convert PIL image to numpy array for EasyOCR
                     img_array = np.array(img)
                     
-                    # Run OCR
-                    result = ocr.ocr(img_array, cls=True)
-                    if result and result[0]:
-                        page_text = "\n".join([line[1][0] for line in result[0] if line])
+                    # Run OCR - EasyOCR returns [(bbox, text, confidence), ...]
+                    result = reader.readtext(img_array)
+                    if result:
+                        page_text = "\n".join([line[1] for line in result if len(line) > 1])
                         if page_text.strip():
                             text_parts.append(f"--- Page {page_num + 1} ---\n{page_text}")
             doc.close()
@@ -283,16 +430,16 @@ def _extract_text_with_paddleocr(file_path: str) -> str:
             img_array = np.array(img)
             
             # Run OCR
-            result = ocr.ocr(img_array, cls=True)
-            if result and result[0]:
-                text = "\n".join([line[1][0] for line in result[0] if line])
+            result = reader.readtext(img_array)
+            if result:
+                text = "\n".join([line[1] for line in result if len(line) > 1])
                 if text.strip():
                     text_parts.append(text)
         
         return "\n\n".join(text_parts) if text_parts else None
     
     except Exception as e:
-        return f"PaddleOCR error: {str(e)}"
+        return f"EasyOCR error: {str(e)}"
 
 
 def _extract_text_with_ollama_vision(file_path: str, api_url: str, vision_model: str, settings: Dict) -> str:
@@ -385,7 +532,7 @@ def extract_tables_from_pdf(file_path: str, use_ocr: bool = False) -> List[Dict]
     """
     Extract tables from PDF.
     For text-based PDFs: uses pdfplumber
-    For scanned PDFs: uses PaddleOCR table recognition
+    For scanned PDFs: uses EasyOCR table recognition
     
     Returns list of tables, each as a dict with 'page', 'table' (2D list), and 'method'
     """
@@ -411,14 +558,14 @@ def extract_tables_from_pdf(file_path: str, use_ocr: bool = False) -> List[Dict]
             # Fall back to OCR if pdfplumber fails
             use_ocr = True
     
-    # For scanned PDFs or if pdfplumber found no tables, use PaddleOCR table recognition
-    if use_ocr or (not tables and _PADDLEOCR_AVAILABLE):
+    # For scanned PDFs or if pdfplumber found no tables, use EasyOCR table recognition
+    if use_ocr or (not tables and _EASYOCR_AVAILABLE):
         try:
             import numpy as np
             from io import BytesIO
             
-            # Initialize PaddleOCR with table recognition
-            ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False, use_gpu=False)
+            # Initialize EasyOCR reader
+            reader = easyocr.Reader(['en'], gpu=False)
             
             doc = fitz.open(file_path)
             for page_num in range(len(doc)):
@@ -432,21 +579,21 @@ def extract_tables_from_pdf(file_path: str, use_ocr: bool = False) -> List[Dict]
                     img_array = np.array(img)
                     
                     # Run OCR with table structure recognition
-                    # Note: PaddleOCR's table recognition requires specific model
-                    # For now, we'll extract text and try to structure it as a table
-                    result = ocr.ocr(img_array, cls=True)
+                    # EasyOCR returns: [(bbox, text, confidence), ...]
+                    result = reader.readtext(img_array)
                     
-                    if result and result[0]:
+                    if result:
                         # Try to detect table structure from OCR results
                         # Group text by approximate Y coordinates to form rows
                         lines = []
-                        for line_result in result[0]:
-                            if line_result:
+                        for line_result in result:
+                            if line_result and len(line_result) >= 2:
                                 bbox = line_result[0]  # Bounding box
-                                text = line_result[1][0]  # Text
+                                text = line_result[1]  # Text
                                 # Calculate center Y coordinate
-                                y_center = sum([point[1] for point in bbox]) / len(bbox)
-                                lines.append((y_center, text, bbox))
+                                if bbox and len(bbox) >= 4:
+                                    y_center = sum([point[1] for point in bbox]) / len(bbox)
+                                    lines.append((y_center, text, bbox))
                         
                         # Group lines into rows (lines with similar Y coordinates)
                         if lines:
@@ -479,7 +626,7 @@ def extract_tables_from_pdf(file_path: str, use_ocr: bool = False) -> List[Dict]
                                 tables.append({
                                     "page": page_num + 1,
                                     "table": rows,
-                                    "method": "paddleocr"
+                                    "method": "easyocr"
                                 })
             
             doc.close()
@@ -519,7 +666,7 @@ def extract_tables_from_pdf(file_path: str, use_ocr: bool = False) -> List[Dict]
     """
     Extract tables from PDF.
     For text-based PDFs: uses pdfplumber
-    For scanned PDFs: uses PaddleOCR table recognition
+    For scanned PDFs: uses EasyOCR table recognition
     
     Returns list of tables, each as a dict with 'page', 'table' (2D list), and 'method'
     """
@@ -545,14 +692,14 @@ def extract_tables_from_pdf(file_path: str, use_ocr: bool = False) -> List[Dict]
             # Fall back to OCR if pdfplumber fails
             use_ocr = True
     
-    # For scanned PDFs or if pdfplumber found no tables, use PaddleOCR table recognition
-    if use_ocr or (not tables and _PADDLEOCR_AVAILABLE):
+    # For scanned PDFs or if pdfplumber found no tables, use EasyOCR table recognition
+    if use_ocr or (not tables and _EASYOCR_AVAILABLE):
         try:
             import numpy as np
             from io import BytesIO
             
-            # Initialize PaddleOCR with table recognition
-            ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False, use_gpu=False)
+            # Initialize EasyOCR reader
+            reader = easyocr.Reader(['en'], gpu=False)
             
             doc = fitz.open(file_path)
             for page_num in range(len(doc)):
@@ -566,19 +713,21 @@ def extract_tables_from_pdf(file_path: str, use_ocr: bool = False) -> List[Dict]
                     img_array = np.array(img)
                     
                     # Run OCR with table structure recognition
-                    result = ocr.ocr(img_array, cls=True)
+                    # EasyOCR returns: [(bbox, text, confidence), ...]
+                    result = reader.readtext(img_array)
                     
-                    if result and result[0]:
+                    if result:
                         # Try to detect table structure from OCR results
                         # Group text by approximate Y coordinates to form rows
                         lines = []
-                        for line_result in result[0]:
-                            if line_result:
+                        for line_result in result:
+                            if line_result and len(line_result) >= 2:
                                 bbox = line_result[0]  # Bounding box
-                                text = line_result[1][0]  # Text
+                                text = line_result[1]  # Text
                                 # Calculate center Y coordinate
-                                y_center = sum([point[1] for point in bbox]) / len(bbox)
-                                lines.append((y_center, text, bbox))
+                                if bbox and len(bbox) >= 4:
+                                    y_center = sum([point[1] for point in bbox]) / len(bbox)
+                                    lines.append((y_center, text, bbox))
                         
                         # Group lines into rows (lines with similar Y coordinates)
                         if lines:
@@ -611,7 +760,7 @@ def extract_tables_from_pdf(file_path: str, use_ocr: bool = False) -> List[Dict]
                                 tables.append({
                                     "page": page_num + 1,
                                     "table": rows,
-                                    "method": "paddleocr"
+                                    "method": "easyocr"
                                 })
             
             doc.close()
@@ -680,8 +829,8 @@ def extract_text_from_document(file_path: str, ocr_engine: str = "tesseract", ap
         if not settings:
             settings = {}
         result = _extract_text_with_ollama_vision(file_path, api_url, vision_model, settings)
-    elif ocr_engine.lower() == "paddleocr":
-        result = _extract_text_with_paddleocr(file_path)
+    elif ocr_engine.lower() == "easyocr":
+        result = _extract_text_with_easyocr(file_path)
     else:  # Default to tesseract
         result = _extract_text_with_tesseract(file_path)
     
@@ -927,30 +1076,106 @@ def build_tab(parent):
                 # Combine all document context
                 combined_text = "\n\n".join(document_context)
                 
-                # Create a prompt for AI to extract MVR fields
-                extraction_prompt = """Extract MVR (Motor Vehicle Record) information from the following document text. 
-Return ONLY a JSON object with these exact fields (use empty strings if not found):
-{
-  "license_number": "",
-  "last_name": "",
-  "first_name": "",
-  "dob": "",
-  "state": ""
-}
+                # Create a prompt for AI to extract MVR fields - look for multiple employees
+                extraction_prompt = """Extract ALL MVR (Motor Vehicle Record) information from the following document text. 
+This document may contain an employee list or multiple people. Extract EVERY person you find.
+
+Return ONLY a JSON array of objects, where each object has these exact fields (use empty strings if not found):
+[
+  {
+    "license_number": "",
+    "last_name": "",
+    "first_name": "",
+    "dob": "",
+    "state": ""
+  }
+]
+
+CRITICAL EXTRACTION RULES:
+1. Extract EVERY row/person in the table/list - do not skip any entries
+2. For EACH person, extract ALL available fields - do not leave any as "Not Specified" or empty if the data exists
+3. Look carefully at each row - sometimes data is in different columns or positions
+4. State abbreviations: Look for 2-letter codes (CA, IL, NY, etc.) or convert full state names to abbreviations
+   - CRITICAL: The state field is REQUIRED if you see any state information
+   - If you see "IL", "1L", "I1", "|L", or similar in the STATE column, extract it as "IL"
+   - Do NOT leave the state field empty if you see any state code or abbreviation
+5. DOB format: Extract dates as MM/DD/YYYY or MM-DD-YYYY format
+6. License numbers: Extract the full license/driver's license number if present
 
 IMPORTANT NAME PARSING RULES:
-- first_name: Extract ONLY the FIRST word of the person's name (e.g., "John" from "John Michael Smith")
-- last_name: Extract ONLY the LAST word of the person's name (e.g., "Smith" from "John Michael Smith" or "Smith" from "John Michael Smith Jr.")
-- If the name is "John Smith", first_name="John", last_name="Smith"
-- If the name is "John Michael Smith", first_name="John", last_name="Smith"
-- If the name is "John Smith Jr.", first_name="John", last_name="Jr."
+- first_name: Extract ONLY the FIRST word of the person's name
+  Examples:
+  - "John Smith" → first_name="John"
+  - "John Michael Smith" → first_name="John"
+  - "Jason Smith Cacas" → first_name="Jason" (NOT "Jason Smith")
+- last_name: Extract ONLY the LAST word of the person's name (even if it looks unusual)
+  Examples:
+  - "John Smith" → last_name="Smith"
+  - "John Michael Smith" → last_name="Smith"
+  - "Jason Smith Cacas" → last_name="Cacas" (NOT "Smith" - Cacas is the last word)
+  - "John Smith Jr." → last_name="Jr."
+- CRITICAL: The LAST word is ALWAYS the last_name, even if it's not a typical surname
 - Do NOT include middle names in either field
+- Do NOT confuse parts of the name with license numbers
+- CRITICAL: Do NOT confuse the POSITION field (like "Sales", "Mec", "Manager") with the last_name
+  - If you see "Alexander nick Bueglar" in the NAME column, the last_name is "Bueglar" (the last word in the NAME field)
+  - The POSITION column is separate and contains job titles like "Sales", "Mec", "Manager", etc.
+  - The last_name comes ONLY from the NAME column, never from the POSITION column
 
-Format DOB as MM/DD/YYYY or MM-DD-YYYY. State should be 2-letter abbreviation (e.g., "CA", "NY").
-If you find a full state name, convert it to abbreviation.
+FIELD EXTRACTION GUIDELINES:
+- license_number: Look for driver's license numbers, license #, DL#, etc.
+  - License numbers are typically NUMERIC or ALPHANUMERIC codes (e.g., "12345678", "CA1234567", "DL-12345")
+  - License numbers are NOT words or names (e.g., "Cacas" is NOT a license number - it's part of a name)
+  - If you see a name like "Jason Smith Cacas", "Cacas" is the last_name, NOT the license_number
+  - Look for actual license number patterns in separate columns or fields
+- state: Look for 2-letter state codes (CA, IL, NY, TX, PA, etc.) - these are often in the same row as the person
+  - State codes are ALWAYS 2 uppercase letters (IL, NY, CA, PA, TX, etc.)
+  - If you see "IL" in the STATE column, extract it as "IL" (not "Illinois" or empty)
+  - State codes are typically in a separate column labeled "STATE" or "State"
+  - Do NOT skip the state field - if you see a 2-letter code, extract it
+  - CRITICAL: OCR often misreads state codes, especially "IL" which may appear as:
+    * "1L" (I misread as 1) → interpret as "IL"
+    * "I1" (L misread as 1) → interpret as "IL"
+    * "|L" (I misread as |) → interpret as "IL"
+    * "|1" (both misread) → interpret as "IL"
+  - If you see a 2-character code in the STATE column that looks like a state code but has OCR errors,
+    use your intelligence to interpret what the correct state code should be
+  - Common state codes: AL, AK, AZ, AR, CA, CO, CT, DE, FL, GA, HI, ID, IL, IN, IA, KS, KY, LA, ME, MD, MA, MI, MN, MS, MO, MT, NE, NV, NH, NJ, NM, NY, NC, ND, OH, OK, OR, PA, RI, SC, SD, TN, TX, UT, VT, VA, WA, WV, WI, WY
+- dob: Look for dates of birth - format should be MM/DD/YYYY or MM-DD-YYYY
+  - Dates are normalized to 2-digit month and day (e.g., "2/4/1999" = "02/04/1999", "12/25/2000" = "12/25/2000")
+  - If you see "214/1999" or similar malformed dates, it's likely "02/14/1999" (missing slash)
+  - CRITICAL: If you see dates with invalid years (like "0419" instead of "2019", "0120" instead of "2003"), 
+    you MUST interpret and correct them to valid years. For example:
+    - "0419" should be interpreted as "2019" (the "20" was misread as "04")
+    - "0120" should be interpreted as "2003" (OCR error)
+    - "0020" should be interpreted as "2000"
+    - Always return the CORRECTED year, not the raw OCR text. Use your intelligence to interpret what the year should be.
+- STATUS field: Look for "FT" (Full-Time) or "PT" (Part-Time) - these may appear with checkbox marks
+  - OCR may read checked boxes as "EFT", "DPT", "XFT", "XPT" - these should be interpreted as "FT" or "PT"
+  - The checked box is indicated by an X mark to the left of FT or PT
+- PERSONAL USE field: Look for "Y" (Yes) or "N" (No) - these may appear with checkbox marks
+  - OCR may read checked boxes as "XY", "XN", "EY", "EN" - these should be interpreted as "Y" or "N"
+  - The checked box is indicated by an X mark to the left of Y or N
+- If you see a table with multiple columns, check ALL columns for each person's information
+- Do NOT assume fields are "Not Specified" - look carefully at the entire row for each person
+- Do NOT confuse name parts with license numbers - names are words, license numbers are codes
+
+Look for employee lists, driver lists, or any tables with names, license numbers, dates of birth, and states.
+Extract ALL entries you find, not just one. For each entry, extract ALL available information.
+
+NOTE: The document may also contain additional information like:
+- STATUS: "FT" (Full-Time) or "PT" (Part-Time) checkboxes
+- PERSONAL USE: "Y" (Yes) or "N" (No) checkboxes
+These fields are not needed for MVR extraction but are part of the employee information.
 
 Document text:
-""" + combined_text[:5000]  # Limit to first 5000 chars
+""" + combined_text[:15000] + """
+
+IMPORTANT: When you see the STATE column, look VERY carefully at what comes after it.
+If you see "1L", "I1", "|L", "|1", or any 2-character code that might be a state abbreviation,
+you MUST extract it. Even if it looks wrong, extract it - we will fix OCR errors in post-processing.
+Do NOT skip the state field if you see ANY text in the STATE column.
+"""
                 
                 # Prepare messages for API
                 api_messages = [
@@ -968,7 +1193,7 @@ Document text:
                     "stream": False,
                     "options": {
                         "temperature": 0.3,  # Lower temperature for more consistent extraction
-                        "num_predict": 500,
+                        "num_predict": 2000,  # Increased for multiple entries
                     }
                 }
                 
@@ -983,28 +1208,154 @@ Document text:
                     if "message" in data and "content" in data["message"]:
                         ai_response = data["message"]["content"].strip()
                         
-                        # Try to extract JSON from response
-                        import re
-                        json_match = re.search(r'\{[^{}]*"license_number"[^{}]*\}', ai_response, re.DOTALL)
-                        if not json_match:
-                            # Try to find JSON in code blocks
-                            json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', ai_response, re.DOTALL)
-                            if json_match:
-                                json_match = json_match.group(1)
-                            else:
-                                json_match = re.search(r'\{.*?"license_number".*?\}', ai_response, re.DOTALL)
+                        # Log raw response for debugging (truncated)
+                        append_to_chat("system", f"AI response length: {len(ai_response)} characters")
+                        if len(ai_response) > 500:
+                            append_to_chat("system", f"AI response preview: {ai_response[:500]}...")
+                        else:
+                            append_to_chat("system", f"AI response: {ai_response}")
                         
-                        if json_match:
-                            json_str = json_match.group(0) if isinstance(json_match, re.Match) else json_match
+                        # Try to extract JSON from response (could be array or single object)
+                        import re
+                        mvr_data_list = None
+                        json_str = None
+                        
+                        # Helper function to find balanced JSON array
+                        def find_json_array(text):
+                            """Find a JSON array with balanced brackets"""
+                            start = text.find('[')
+                            if start == -1:
+                                return None
+                            
+                            bracket_count = 0
+                            in_string = False
+                            escape_next = False
+                            
+                            for i in range(start, len(text)):
+                                char = text[i]
+                                
+                                if escape_next:
+                                    escape_next = False
+                                    continue
+                                
+                                if char == '\\':
+                                    escape_next = True
+                                    continue
+                                
+                                if char == '"' and not escape_next:
+                                    in_string = not in_string
+                                    continue
+                                
+                                if not in_string:
+                                    if char == '[':
+                                        bracket_count += 1
+                                    elif char == ']':
+                                        bracket_count -= 1
+                                        if bracket_count == 0:
+                                            return text[start:i+1]
+                            
+                            return None
+                        
+                        # Try to find JSON array using balanced bracket matching
+                        json_str = find_json_array(ai_response)
+                        
+                        if not json_str:
+                            # Try to find JSON in code blocks (array)
+                            json_match = re.search(r'```(?:json)?\s*(\[.*?\])\s*```', ai_response, re.DOTALL)
+                            if json_match:
+                                json_str = json_match.group(1)
+                            else:
+                                # Try single object (backward compatibility)
+                                json_match = re.search(r'\{[^{}]*"license_number"[^{}]*\}', ai_response, re.DOTALL)
+                                if json_match:
+                                    json_str = json_match.group(0)
+                                else:
+                                    # Try code block with single object
+                                    json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', ai_response, re.DOTALL)
+                                    if json_match:
+                                        json_str = json_match.group(1)
+                        
+                        if json_str:
                             try:
-                                mvr_data = json.loads(json_str)
+                                mvr_data_list = json.loads(json_str)
+                                # Ensure it's a list (handle single object case)
+                                if not isinstance(mvr_data_list, list):
+                                    mvr_data_list = [mvr_data_list]
+                                
+                                # Post-process extracted data to fix common issues
+                                def fix_state_code_in_data(state_value):
+                                    """Fix state codes that might have OCR errors"""
+                                    if not state_value or not isinstance(state_value, str):
+                                        return state_value
+                                    
+                                    state_value = state_value.strip().upper()
+                                    
+                                    # State code corrections (same as in _clean_ocr_text)
+                                    state_corrections = {
+                                        "1L": "IL", "I1": "IL", "|L": "IL", "|1": "IL",
+                                        "1l": "IL", "i1": "IL", "|l": "IL",
+                                        "N1": "NY", "C4": "CA", "P4": "PA",
+                                        "F1": "FL", "0H": "OH", "M1": "MI",
+                                    }
+                                    
+                                    # Check if it's a known misreading
+                                    if state_value in state_corrections:
+                                        return state_corrections[state_value]
+                                    
+                                    # If it's already a valid 2-letter state code, return it
+                                    if len(state_value) == 2 and state_value.isalpha():
+                                        return state_value
+                                    
+                                    # If it looks like a misread state code (has digits or special chars)
+                                    if len(state_value) == 2:
+                                        # Try to fix common patterns
+                                        if state_value[0] in "1|" and state_value[1] == "L":
+                                            return "IL"
+                                        if state_value[0] == "I" and state_value[1] in "1|":
+                                            return "IL"
+                                    
+                                    return state_value
+                                
+                                # Apply state code fixes to all entries
+                                for idx, entry in enumerate(mvr_data_list, 1):
+                                    if 'state' in entry:
+                                        original_state = entry.get('state', '')
+                                        if original_state:
+                                            fixed_state = fix_state_code_in_data(entry['state'])
+                                            if fixed_state != original_state:
+                                                append_to_chat("system", f"Entry {idx}: Fixed state code: '{original_state}' → '{fixed_state}'")
+                                            entry['state'] = fixed_state
+                                        else:
+                                            # State is missing - try to find it in the cleaned text
+                                            append_to_chat("system", f"Entry {idx}: WARNING - State field is empty/missing")
+                                            # Log what the AI saw for this entry
+                                            name = f"{entry.get('first_name', '')} {entry.get('last_name', '')}".strip()
+                                            append_to_chat("system", f"  Entry data: {entry}")
+                                
+                                # Log what was extracted for debugging
+                                append_to_chat("system", f"AI extracted {len(mvr_data_list)} entr{'y' if len(mvr_data_list) == 1 else 'ies'} from JSON")
+                                
+                                # Log the raw JSON for debugging (especially DOB and state values)
+                                for idx, entry in enumerate(mvr_data_list, 1):
+                                    dob_value = entry.get('dob', '')
+                                    state_value = entry.get('state', '')
+                                    name = f"{entry.get('first_name', '')} {entry.get('last_name', '')}".strip()
+                                    append_to_chat("system", f"Entry {idx} ({name}):")
+                                    if dob_value:
+                                        append_to_chat("system", f"  DOB: '{dob_value}'")
+                                    if state_value:
+                                        append_to_chat("system", f"  State (before fix): '{state_value}'")
+                                    else:
+                                        append_to_chat("system", f"  State: MISSING/EMPTY")
                                 
                                 # Import to MVR Runner
                                 def import_to_mvr():
                                     try:
                                         # Try to import MvrRunner and add the entry
+                                        mvr_module = None
                                         try:
                                             from Tabs import MvrRunner
+                                            mvr_module = MvrRunner
                                             callback = getattr(MvrRunner, '_add_mvr_entry_callback', None)
                                         except (ImportError, AttributeError):
                                             # Try alternative import
@@ -1013,25 +1364,67 @@ Document text:
                                             callback = getattr(mvr_module, '_add_mvr_entry_callback', None)
                                         
                                         if callback:
-                                            success, message = callback(mvr_data, source="Ollama AI")
-                                            if success:
-                                                append_to_chat("system", f"✓ MVR data imported to MVR Runner: {mvr_data.get('last_name', '')}, {mvr_data.get('first_name', '')}")
-                                                update_status("MVR data imported successfully - check MVR Runner tab")
+                                            imported_count = 0
+                                            skipped_count = 0
+                                            total_entries = len(mvr_data_list)
+                                            append_to_chat("system", f"Processing {total_entries} MVR entr{'y' if total_entries == 1 else 'ies'}...")
+                                            
+                                            for idx, mvr_data in enumerate(mvr_data_list, 1):
+                                                # Log what we're trying to import
+                                                name_info = f"{mvr_data.get('first_name', '')} {mvr_data.get('last_name', '')}".strip()
+                                                if not name_info:
+                                                    name_info = f"Entry {idx} (no name)"
+                                                
+                                                # Show full data being imported
+                                                data_preview = {k: v for k, v in mvr_data.items() if v}
+                                                append_to_chat("system", f"Processing entry {idx}/{total_entries}: {name_info}")
+                                                append_to_chat("system", f"  Data: {data_preview}")
+                                                
+                                                try:
+                                                    success, message = callback(mvr_data, source="Ollama AI")
+                                                    if success:
+                                                        imported_count += 1
+                                                        append_to_chat("system", f"✓ Imported entry {idx}: {name_info}")
+                                                    else:
+                                                        skipped_count += 1
+                                                        append_to_chat("system", f"⚠ Skipped entry {idx}: {name_info} - {message}")
+                                                except Exception as e:
+                                                    skipped_count += 1
+                                                    append_to_chat("system", f"✗ Error importing entry {idx}: {name_info} - {str(e)}")
+                                                    import traceback
+                                                    append_to_chat("system", f"  Error details: {traceback.format_exc()[:200]}")
+                                            
+                                            if imported_count > 0:
+                                                append_to_chat("system", f"✓ Successfully imported {imported_count} of {total_entries} MVR entr{'y' if imported_count == 1 else 'ies'} to MVR Runner")
+                                                if skipped_count > 0:
+                                                    append_to_chat("system", f"⚠ {skipped_count} entr{'y' if skipped_count == 1 else 'ies'} skipped (likely duplicates)")
+                                                
+                                                # Scroll listbox to top so user can see all entries
+                                                try:
+                                                    if mvr_module:
+                                                        scroll_func = getattr(mvr_module, '_scroll_listbox_to_top', None)
+                                                        if scroll_func:
+                                                            scroll_func()
+                                                except Exception:
+                                                    pass
+                                                
+                                                update_status(f"MVR data imported: {imported_count}/{total_entries} entr{'y' if imported_count == 1 else 'ies'} - check MVR Runner tab")
                                             else:
-                                                append_to_chat("system", f"⚠ {message}")
-                                                # Still show the data
-                                                data_str = "\n".join([f"{k}: {v}" for k, v in mvr_data.items() if v])
-                                                append_to_chat("system", f"Extracted MVR data:\n{data_str}")
-                                                update_status("MVR data extracted - see chat")
+                                                append_to_chat("system", f"⚠ No entries imported ({skipped_count} skipped - likely all duplicates)")
+                                                update_status("MVR extraction completed - see chat for details")
                                         else:
                                             # Fallback: show the data and instructions
-                                            data_str = "\n".join([f"{k}: {v}" for k, v in mvr_data.items() if v])
-                                            append_to_chat("system", f"Extracted MVR data:\n{data_str}\n\nSwitch to MVR Runner tab and manually enter this data.")
+                                            for idx, mvr_data in enumerate(mvr_data_list, 1):
+                                                data_str = "\n".join([f"{k}: {v}" for k, v in mvr_data.items() if v])
+                                                append_to_chat("system", f"Entry {idx}:\n{data_str}")
+                                            append_to_chat("system", f"\nSwitch to MVR Runner tab and manually enter this data.")
                                             update_status("MVR data extracted - see chat for details")
                                     except Exception as e:
                                         # Fallback: display extracted data
-                                        data_str = "\n".join([f"{k}: {v}" for k, v in mvr_data.items() if v])
-                                        append_to_chat("system", f"Extracted MVR data:\n{data_str}\n\nPlease manually enter this in MVR Runner tab.")
+                                        for idx, mvr_data in enumerate(mvr_data_list, 1):
+                                            data_str = "\n".join([f"{k}: {v}" for k, v in mvr_data.items() if v])
+                                            append_to_chat("system", f"Entry {idx}:\n{data_str}")
+                                        append_to_chat("system", f"\nPlease manually enter this in MVR Runner tab.")
                                         append_to_chat("system", f"Error importing automatically: {str(e)}")
                                         update_status("MVR data extracted - see chat")
                                 
@@ -1179,8 +1572,8 @@ Document text:
                             append_to_chat("system", "Falling back to Tesseract.")
                             ocr_engine = "tesseract"
                 
-                if ocr_engine == "paddleocr" and not _PADDLEOCR_AVAILABLE:
-                    append_to_chat("system", "PaddleOCR is not installed. Falling back to Tesseract.")
+                if ocr_engine == "easyocr" and not _EASYOCR_AVAILABLE:
+                    append_to_chat("system", "EasyOCR is not installed. Falling back to Tesseract.")
                     ocr_engine = "tesseract"
                 
                 if ocr_engine == "tesseract" and not _TESSERACT_AVAILABLE:
@@ -1200,9 +1593,10 @@ Document text:
                 else:
                     extracted_text = extract_text_from_document(file_path, ocr_engine)
                 
-                if extracted_text and not extracted_text.startswith("Error") and not extracted_text.startswith("Tesseract OCR error") and not extracted_text.startswith("PaddleOCR error") and not extracted_text.startswith("Ollama vision error"):
-                    # Store extracted text in document context (don't display in input)
-                    document_context.append(extracted_text)
+                if extracted_text and not extracted_text.startswith("Error") and not extracted_text.startswith("Tesseract OCR error") and not extracted_text.startswith("EasyOCR error") and not extracted_text.startswith("Ollama vision error"):
+                    # Clean OCR text and store in document context (don't display in input)
+                    cleaned_text = _clean_ocr_text(extracted_text)
+                    document_context.append(cleaned_text)
                     
                     # Try to extract tables from PDF
                     tables = []
@@ -1331,7 +1725,7 @@ Document text:
                     
                     if _PIL_AVAILABLE and isinstance(clipboard_image, Image.Image):
                         img = clipboard_image
-                        # Convert image to RGB mode (required for Tesseract and better for PaddleOCR)
+                        # Convert image to RGB mode (required for Tesseract and EasyOCR)
                         if img.mode != 'RGB':
                             img = img.convert('RGB')
                     else:
@@ -1339,51 +1733,74 @@ Document text:
                         update_status("Image processing failed")
                         return
                     
-                    # Convert to numpy array for OCR (only if using PaddleOCR)
+                    # Convert to numpy array for OCR (for EasyOCR)
                     img_array = None
-                    if _PADDLEOCR_AVAILABLE:
+                    if _EASYOCR_AVAILABLE:
                         img_array = np.array(img)
                     
                     # Determine OCR engine
                     ocr_engine = settings.get("ocr_engine", "tesseract")
                     
                     extracted_text = None
+                    easyocr_text = None
+                    tesseract_text = None
+                    ocr_used = None
                     tables = []
                     
-                    # Try PaddleOCR first (better for tables)
-                    if _PADDLEOCR_AVAILABLE and img_array is not None:
+                    # Try EasyOCR first (better for tables)
+                    # Note: For very short text like "IL", Tesseract with PSM 8 might work better
+                    if _EASYOCR_AVAILABLE and img_array is not None:
                         try:
-                            ocr = PaddleOCR(use_angle_cls=True, lang='en', show_log=False, use_gpu=False)
-                            result = ocr.ocr(img_array, cls=True)
+                            # Initialize EasyOCR reader (reuse if possible, but create new for each image to avoid issues)
+                            reader = easyocr.Reader(['en'], gpu=False)
+                            # EasyOCR returns: [(bbox, text, confidence), ...]
+                            # bbox format: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
+                            # For better accuracy on short text, we can adjust parameters
+                            result = reader.readtext(img_array, paragraph=False)  # paragraph=False helps with short text
                             
-                            if result and result[0]:
-                                # Extract text
+                            if result:
+                                # Extract text - EasyOCR result structure is simpler
                                 text_lines = []
-                                for line_result in result[0]:
-                                    if line_result and len(line_result) > 1:
-                                        text = line_result[1][0] if isinstance(line_result[1], (list, tuple)) else str(line_result[1])
-                                        if text:
-                                            text_lines.append(text)
-                                extracted_text = "\n".join(text_lines) if text_lines else None
+                                lines = []  # For table detection
+                                
+                                for line_result in result:
+                                    if line_result and len(line_result) >= 2:
+                                        # line_result[0] is bbox, line_result[1] is text, line_result[2] is confidence
+                                        text = line_result[1] if isinstance(line_result[1], str) else str(line_result[1])
+                                        
+                                        if text and text.strip():
+                                            text_lines.append(text.strip())
+                                            
+                                            # For table detection
+                                            bbox = line_result[0]
+                                            if bbox and len(bbox) >= 4:
+                                                # Calculate center Y coordinate
+                                                y_center = sum([point[1] for point in bbox]) / len(bbox)
+                                                lines.append((y_center, text.strip(), bbox))
+                                
+                                easyocr_text = "\n".join(text_lines) if text_lines else None
+                                
+                                # Debug: log extraction details
+                                if easyocr_text:
+                                    append_to_chat("system", f"✓ EasyOCR extracted {len(text_lines)} text line(s), {len(easyocr_text)} total characters")
+                                    # Log the actual extracted text for debugging state codes
+                                    append_to_chat("system", f"EasyOCR raw text: {easyocr_text[:500]}")  # First 500 chars
+                                    # Specifically look for state-like patterns
+                                    state_patterns = re.findall(r'\b([A-Z0-9|]{2})\b', easyocr_text)
+                                    if state_patterns:
+                                        append_to_chat("system", f"EasyOCR found potential state codes: {state_patterns}")
+                                    
+                                    # Look specifically for "STATE" column and what follows it
+                                    state_column_matches = re.findall(r'\bSTATE\s+([A-Z0-9|]{1,3})\b', easyocr_text, re.IGNORECASE)
+                                    if state_column_matches:
+                                        append_to_chat("system", f"EasyOCR found text after 'STATE' label: {state_column_matches}")
+                                    
+                                    # Look for common IL misreadings specifically
+                                    il_patterns = re.findall(r'\b([1|I][1|L]|[I1][L1])\b', easyocr_text, re.IGNORECASE)
+                                    if il_patterns:
+                                        append_to_chat("system", f"EasyOCR found potential IL misreadings: {il_patterns}")
                                 
                                 # Try to detect table structure
-                                lines = []
-                                for line_result in result[0]:
-                                    if line_result and len(line_result) >= 2:
-                                        try:
-                                            bbox = line_result[0]
-                                            text_data = line_result[1]
-                                            if isinstance(text_data, (list, tuple)) and len(text_data) > 0:
-                                                text = text_data[0]
-                                            else:
-                                                text = str(text_data)
-                                            
-                                            if bbox and len(bbox) > 0:
-                                                y_center = sum([point[1] for point in bbox]) / len(bbox)
-                                                lines.append((y_center, text, bbox))
-                                        except Exception:
-                                            pass  # Skip malformed entries
-                                
                                 if lines:
                                     lines.sort(key=lambda x: x[0])
                                     rows = []
@@ -1410,28 +1827,34 @@ Document text:
                                         tables.append({
                                             "page": 1,
                                             "table": rows,
-                                            "method": "paddleocr"
+                                            "method": "easyocr"
                                         })
                         except Exception as e:
                             # Log the error for debugging
-                            error_msg = f"PaddleOCR error: {str(e)}"
+                            error_msg = f"EasyOCR error: {str(e)}"
                             append_to_chat("system", error_msg)
                             import traceback
-                            traceback.print_exc()
+                            error_details = traceback.format_exc()
+                            append_to_chat("system", f"EasyOCR traceback:\n{error_details[:500]}")
                     
-                    # Use Tesseract if PaddleOCR not available or didn't work
-                    # IMPORTANT: Always try Tesseract if no text extracted yet
-                    if (not extracted_text or not extracted_text.strip()) and _TESSERACT_AVAILABLE:
-                        # Log which OCR we're using
-                        if not _PADDLEOCR_AVAILABLE:
-                            append_to_chat("system", "PaddleOCR not available - using Tesseract OCR...")
-                        elif not extracted_text:
-                            append_to_chat("system", "PaddleOCR didn't extract text - trying Tesseract OCR...")
+                    # ALWAYS try Tesseract to combine results with EasyOCR
+                    # Tesseract with PSM 8 (single word) is better for short text like "IL"
+                    # We'll combine results from both engines to catch everything
+                    if _TESSERACT_AVAILABLE:
+                        # Log that we're running Tesseract to combine with EasyOCR
+                        if easyocr_text:
+                            append_to_chat("system", "Running Tesseract OCR to combine with EasyOCR results...")
+                        elif not _EASYOCR_AVAILABLE:
+                            append_to_chat("system", "EasyOCR not available - using Tesseract OCR...")
+                        else:
+                            append_to_chat("system", "EasyOCR didn't extract text - trying Tesseract OCR...")
                         
                         try:
-                            # Try different PSM modes for better table detection
+                            # Try different PSM modes for better detection
+                            # PSM 8 = single word (best for short codes like "IL")
+                            # PSM 7 = single text line
                             # PSM 6 = uniform block of text, PSM 11 = sparse text, PSM 4 = single column
-                            psm_modes = [('6', 'uniform block'), ('11', 'sparse text'), ('4', 'single column'), ('3', 'fully automatic')]
+                            psm_modes = [('8', 'single word'), ('7', 'single line'), ('6', 'uniform block'), ('11', 'sparse text'), ('4', 'single column'), ('3', 'fully automatic')]
                             
                             for psm, desc in psm_modes:
                                 try:
@@ -1446,8 +1869,24 @@ Document text:
                                         config=f'--psm {psm}'
                                     )
                                     if result_text and result_text.strip():
-                                        extracted_text = result_text
-                                        append_to_chat("system", f"✓ Tesseract (PSM {psm} - {desc}) extracted {len(extracted_text.strip())} characters")
+                                        tesseract_text = result_text
+                                        append_to_chat("system", f"✓ Tesseract (PSM {psm} - {desc}) extracted {len(tesseract_text.strip())} characters")
+                                        # Log the actual extracted text for debugging state codes
+                                        append_to_chat("system", f"Tesseract raw text: {tesseract_text[:500]}")  # First 500 chars
+                                        # Specifically look for state-like patterns
+                                        state_patterns = re.findall(r'\b([A-Z0-9|]{2})\b', tesseract_text)
+                                        if state_patterns:
+                                            append_to_chat("system", f"Tesseract found potential state codes: {state_patterns}")
+                                        
+                                        # Look specifically for "STATE" column and what follows it
+                                        state_column_matches = re.findall(r'\bSTATE\s+([A-Z0-9|]{1,3})\b', tesseract_text, re.IGNORECASE)
+                                        if state_column_matches:
+                                            append_to_chat("system", f"Tesseract found text after 'STATE' label: {state_column_matches}")
+                                        
+                                        # Look for common IL misreadings specifically
+                                        il_patterns = re.findall(r'\b([1|I][1|L]|[I1][L1])\b', tesseract_text, re.IGNORECASE)
+                                        if il_patterns:
+                                            append_to_chat("system", f"Tesseract found potential IL misreadings: {il_patterns}")
                                         ocr_used = "tesseract"
                                         break
                                 except Exception as e:
@@ -1459,7 +1898,7 @@ Document text:
                                     continue
                             
                             # If still no text, try without specific PSM (default)
-                            if not extracted_text or not extracted_text.strip():
+                            if not tesseract_text or not tesseract_text.strip():
                                 try:
                                     # Ensure image is in correct format for Tesseract
                                     # Tesseract works best with RGB images
@@ -1469,8 +1908,8 @@ Document text:
                                     
                                     result_text = pytesseract.image_to_string(tesseract_img, lang='eng')
                                     if result_text and result_text.strip():
-                                        extracted_text = result_text
-                                        append_to_chat("system", f"✓ Tesseract (default) extracted {len(extracted_text.strip())} characters")
+                                        tesseract_text = result_text
+                                        append_to_chat("system", f"✓ Tesseract (default) extracted {len(tesseract_text.strip())} characters")
                                         ocr_used = "tesseract"
                                 except Exception as e:
                                     error_detail = str(e)
@@ -1487,8 +1926,8 @@ Document text:
                                             reloaded_img = reloaded_img.convert('RGB')
                                             result_text = pytesseract.image_to_string(reloaded_img, lang='eng')
                                             if result_text and result_text.strip():
-                                                extracted_text = result_text
-                                                append_to_chat("system", f"✓ Tesseract (after conversion) extracted {len(extracted_text.strip())} characters")
+                                                tesseract_text = result_text
+                                                append_to_chat("system", f"✓ Tesseract (after conversion) extracted {len(tesseract_text.strip())} characters")
                                                 ocr_used = "tesseract"
                                             else:
                                                 append_to_chat("system", f"Tesseract: Image converted but no text found")
@@ -1505,26 +1944,94 @@ Document text:
                     elif not _TESSERACT_AVAILABLE:
                         append_to_chat("system", "Tesseract not available. Please install pytesseract and Tesseract OCR.")
                     
+                    # Combine results from both OCR engines
+                    # Merge EasyOCR and Tesseract text, prioritizing unique content
+                    def combine_ocr_results(easy_text, tess_text):
+                        """Combine text from both OCR engines, avoiding duplicates"""
+                        if not easy_text and not tess_text:
+                            return None
+                        if not easy_text:
+                            return tess_text
+                        if not tess_text:
+                            return easy_text
+                        
+                        # Split into lines for comparison
+                        easy_lines = set(line.strip() for line in easy_text.split('\n') if line.strip())
+                        tess_lines = set(line.strip() for line in tess_text.split('\n') if line.strip())
+                        
+                        # Combine unique lines
+                        combined_lines = list(easy_lines | tess_lines)  # Union of both sets
+                        
+                        # Try to preserve order (prefer EasyOCR order, add Tesseract unique lines)
+                        result_lines = []
+                        seen = set()
+                        
+                        # Add EasyOCR lines first
+                        for line in easy_text.split('\n'):
+                            line_stripped = line.strip()
+                            if line_stripped and line_stripped not in seen:
+                                result_lines.append(line)
+                                seen.add(line_stripped)
+                        
+                        # Add Tesseract unique lines
+                        for line in tess_text.split('\n'):
+                            line_stripped = line.strip()
+                            if line_stripped and line_stripped not in seen:
+                                result_lines.append(line)
+                                seen.add(line_stripped)
+                        
+                        combined = '\n'.join(result_lines)
+                        append_to_chat("system", f"Combined OCR results: {len(easy_lines)} EasyOCR lines + {len(tess_lines)} Tesseract lines = {len(result_lines)} unique lines")
+                        return combined
+                    
+                    # Combine both OCR results
+                    extracted_text = combine_ocr_results(easyocr_text, tesseract_text)
+                    
                     # Update UI
                     def update_ui():
+                        # Capture extracted_text from outer scope
+                        nonlocal extracted_text
                         if extracted_text and extracted_text.strip():
-                            document_context.append(extracted_text)
-                            msg = f"Image processed from clipboard ({len(extracted_text)} characters extracted)"
+                            # Clean OCR text to fix common issues (dates, checkbox marks)
+                            cleaned_text = _clean_ocr_text(extracted_text)
+                            document_context.append(cleaned_text)
+                            # Use cleaned version for all display purposes
+                            msg = f"Image processed from clipboard ({len(cleaned_text)} characters extracted)"
                             if tables:
                                 msg += f"\nFound {len(tables)} table(s)"
                                 for table_info in tables:
                                     table_text = format_table_as_text(table_info["table"])
                                     if table_text:
                                         append_to_chat("system", f"Table from clipboard ({table_info['method']}):\n{table_text[:1000]}...")
+                            
+                            # Display the extracted text so AI can see it
                             append_to_chat("system", msg)
+                            
+                            # Check if checkbox information is present and add context (use cleaned text)
+                            checkbox_note = ""
+                            if "FT" in cleaned_text or "PT" in cleaned_text:
+                                checkbox_note += "\nNote: STATUS checkboxes detected (FT=Full-Time, PT=Part-Time). "
+                            if (" Y " in cleaned_text or " N " in cleaned_text or 
+                                cleaned_text.startswith("Y ") or cleaned_text.startswith("N ") or
+                                " Y\n" in cleaned_text or " N\n" in cleaned_text):
+                                checkbox_note += "PERSONAL USE checkboxes detected (Y=Yes, N=No)."
+                            
+                            # Show extracted text (truncate if very long, but show enough for context)
+                            display_text = cleaned_text
+                            if len(display_text) > 2000:
+                                display_text = display_text[:2000] + "\n... (truncated, full text available for MVR extraction)"
+                            
+                            append_to_chat("system", f"Extracted text:\n{display_text}")
+                            if checkbox_note:
+                                append_to_chat("system", checkbox_note.strip())
                             update_status("Ready - Image processed")
                         else:
                             # Provide more detailed error message
                             error_details = []
-                            if not _PADDLEOCR_AVAILABLE and not _TESSERACT_AVAILABLE:
-                                error_details.append("No OCR engines available. Install PaddleOCR or Tesseract.")
-                            elif not _PADDLEOCR_AVAILABLE:
-                                error_details.append("PaddleOCR not available.")
+                            if not _EASYOCR_AVAILABLE and not _TESSERACT_AVAILABLE:
+                                error_details.append("No OCR engines available. Install EasyOCR or Tesseract.")
+                            elif not _EASYOCR_AVAILABLE:
+                                error_details.append("EasyOCR not available.")
                             elif not _TESSERACT_AVAILABLE:
                                 error_details.append("Tesseract not available.")
                             else:
@@ -1678,7 +2185,7 @@ Document text:
         ocr_engine_combo = ttk.Combobox(
             settings_frame,
             textvariable=ocr_engine_var,
-            values=["tesseract", "paddleocr", "ollama_vision"],
+            values=["tesseract", "easyocr", "ollama_vision"],
             state="readonly",
             width=37
         )
@@ -1712,10 +2219,10 @@ Document text:
             ocr_status_text.append("Tesseract: ✓")
         else:
             ocr_status_text.append("Tesseract: ✗")
-        if _PADDLEOCR_AVAILABLE:
-            ocr_status_text.append("PaddleOCR: ✓")
+        if _EASYOCR_AVAILABLE:
+            ocr_status_text.append("EasyOCR: ✓")
         else:
-            ocr_status_text.append("PaddleOCR: ✗")
+            ocr_status_text.append("EasyOCR: ✗")
         ocr_status_text.append("Ollama Vision: Available")
         
         ocr_status_label = ttk.Label(
@@ -1926,7 +2433,7 @@ Document text:
             pass
         
         # Allow normal text paste if not an image or if check failed
-        # Return None to allow default paste behavior
+        # Return None to allow default paste behavior (don't prevent default)
         return None
     
     # Bind paste events with add="+" to not override default behavior completely
