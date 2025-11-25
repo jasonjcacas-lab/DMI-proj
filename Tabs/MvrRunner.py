@@ -322,22 +322,95 @@ def _find_chrome_executable():
 def _extract_text_from_pdf(pdf_path: str) -> str:
     """
     Fast extraction for text-based PDFs using PyMuPDF.
+    Enhanced to better handle tables and provide OCR fallback.
     """
     if not fitz:
         raise RuntimeError("PyMuPDF is not installed. Please install 'pymupdf'.")
     doc = fitz.open(pdf_path)
     try:
-        parts = []
-        for page in doc:
-            # Use blocks to preserve reading order better than plain text
-            parts.append(page.get_text("blocks"))
-        # Flatten blocks into lines; each block is a tuple (x0, y0, x1, y1, text, block_no, block_type)
-        lines = []
-        for blocks in parts:
+        all_text_parts = []
+        
+        for page_num, page in enumerate(doc):
+            # Method 1: Try native text extraction with blocks (preserves table structure)
+            blocks = page.get_text("blocks")
+            page_lines = []
             for b in blocks:
                 if len(b) >= 5 and isinstance(b[4], str):
-                    lines.append(b[4].strip())
-        return "\n".join([ln for ln in lines if ln])
+                    text = b[4].strip()
+                    if text:
+                        page_lines.append(text)
+            
+            # Method 2: Also try "dict" format which preserves table structure better
+            # This gives us more precise positioning info
+            try:
+                text_dict = page.get_text("dict")
+                # Extract text from dict format, preserving spatial relationships
+                dict_lines = []
+                for block in text_dict.get("blocks", []):
+                    if "lines" in block:
+                        for line in block["lines"]:
+                            line_text = ""
+                            for span in line.get("spans", []):
+                                span_text = span.get("text", "").strip()
+                                if span_text:
+                                    line_text += span_text + " "
+                            if line_text.strip():
+                                dict_lines.append(line_text.strip())
+                # Use dict format if it found more text or if blocks found very little
+                if len(dict_lines) > len(page_lines) * 0.8 or len(page_lines) < 10:
+                    page_lines = dict_lines
+            except Exception:
+                pass  # Fallback to blocks if dict fails
+            
+            # Method 3: Try "words" format for table-like structures
+            # This can help when text is in table cells
+            if len(page_lines) < 5:  # If we got very little text, try words format
+                try:
+                    words = page.get_text("words")
+                    # Group words by approximate y-coordinate (same row)
+                    rows = {}
+                    for word in words:
+                        if len(word) >= 5:
+                            y = round(word[1] / 5) * 5  # Round to nearest 5 pixels
+                            if y not in rows:
+                                rows[y] = []
+                            rows[y].append((word[4], word[0]))  # (text, x-coord)
+                    
+                    # Sort by y, then by x within each row
+                    word_lines = []
+                    for y in sorted(rows.keys()):
+                        row_words = sorted(rows[y], key=lambda w: w[1])
+                        row_text = " ".join(w[0] for w in row_words).strip()
+                        if row_text:
+                            word_lines.append(row_text)
+                    
+                    if len(word_lines) > len(page_lines):
+                        page_lines = word_lines
+                except Exception:
+                    pass
+            
+            all_text_parts.extend(page_lines)
+        
+        extracted_text = "\n".join([ln for ln in all_text_parts if ln])
+        
+        # If we got very little text, it might be a scanned PDF - try OCR fallback
+        if len(extracted_text.strip()) < 50:
+            try:
+                import pytesseract
+                from PIL import Image
+                import io
+                
+                # Try OCR on first page
+                first_page = doc[0]
+                pix = first_page.get_pixmap(dpi=300)
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                ocr_text = pytesseract.image_to_string(img, config="--oem 1 --psm 6")
+                if len(ocr_text.strip()) > len(extracted_text.strip()):
+                    extracted_text = ocr_text + "\n" + extracted_text
+            except Exception:
+                pass  # OCR not available or failed
+        
+        return extracted_text
     finally:
         doc.close()
 
@@ -431,25 +504,41 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
     # State - try multiple patterns
     # US state abbreviations (2 letters) and full state names
     state_patterns = [
-        # HIGHEST PRIORITY: SambaSafety format - "[State Name] Driver Record - [Account ID]"
+        # HIGHEST PRIORITY: Table format - "STATE" header followed by state codes
+        # This handles the case where STATE is a column header and IL appears below it
+        (r"(?i)^\s*STATE\s*$.*?^\s*([A-Z0-9|]{2})\s*$", 1, re.MULTILINE | re.DOTALL),  # STATE header on one line, code on next
+        (r"(?i)\bSTATE\s+([A-Z0-9|]{2})\b", 1),  # STATE followed immediately by code
+        (r"(?i)\bSTATE\s*:?\s*([A-Z0-9|]{2})\b", 1),  # STATE: followed by code
+        # HIGH PRIORITY: SambaSafety format - "[State Name] Driver Record - [Account ID]"
         (r"(?i)^\s*([A-Z][A-Z\s]+?)\s+Driver\s+Record\s*-\s*[A-Z0-9]+\s*$", 1),  # Full state name before "Driver Record -"
         (r"(?i)([A-Z][A-Z\s]+?)\s+Driver\s+Record\s*-\s*[A-Z0-9]+", 1),  # Full state name before "Driver Record -" (anywhere in text)
         # Patterns with explicit "State" label
-        (r"(?i)\b(State|State\s+of\s+Issue|Issuing\s+State|License\s+State|State\s+Code)\s*:?\s*([A-Z]{2})\b", 2),  # 2-letter abbreviation with label
+        (r"(?i)\b(State|State\s+of\s+Issue|Issuing\s+State|License\s+State|State\s+Code)\s*:?\s*([A-Z0-9|]{2})\b", 2),  # 2-letter abbreviation with label
         (r"(?i)\b(State|State\s+of\s+Issue|Issuing\s+State|License\s+State|State\s+Code)\s*:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b", 2),  # Full state name with label
         # Patterns without explicit label (context-based)
-        (r"\b([A-Z]{2})\s+(?:Driver|License|DL|MVR|Drivers?)\b", 1),  # State abbreviation before "Driver" or "License"
-        (r"\b(?:Driver|License|DL|MVR|Drivers?)\s+([A-Z]{2})\b", 1),  # State abbreviation after "Driver" or "License"
-        (r"\b([A-Z]{2})\s+[0-9]{4,}\b", 1),  # State abbreviation followed by numbers (likely license number)
+        (r"\b([A-Z0-9|]{2})\s+(?:Driver|License|DL|MVR|Drivers?)\b", 1),  # State abbreviation before "Driver" or "License"
+        (r"\b(?:Driver|License|DL|MVR|Drivers?)\s+([A-Z0-9|]{2})\b", 1),  # State abbreviation after "Driver" or "License"
+        (r"\b([A-Z0-9|]{2})\s+[0-9]{4,}\b", 1),  # State abbreviation followed by numbers (likely license number)
         # Standalone state abbreviations in common contexts
-        (r"(?i)\b(State|State\s+Code)\s*:?\s*([A-Z]{2})\b", 2),  # Just "State:" or "State Code:" followed by abbreviation
+        (r"(?i)\b(State|State\s+Code)\s*:?\s*([A-Z0-9|]{2})\b", 2),  # Just "State:" or "State Code:" followed by abbreviation
         (r"(?i)\b(State|State\s+Code)\s*:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b", 2),  # Just "State:" or "State Code:" followed by full name
         # Look for state names/abbreviations near other license fields
-        (r"(?i)(?:License|DL|MVR|Driver).*?(?:State|State\s+of\s+Issue|Issuing\s+State)\s*:?\s*([A-Z]{2})\b", 1),  # State abbrev near license keywords
+        (r"(?i)(?:License|DL|MVR|Driver).*?(?:State|State\s+of\s+Issue|Issuing\s+State)\s*:?\s*([A-Z0-9|]{2})\b", 1),  # State abbrev near license keywords
         (r"(?i)(?:License|DL|MVR|Driver).*?(?:State|State\s+of\s+Issue|Issuing\s+State)\s*:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b", 1),  # State name near license keywords
     ]
     # Also check for common state abbreviations in context
     us_states_abbrev = ["AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC"]
+    
+    # OCR error corrections for state codes (common misreadings)
+    ocr_state_corrections = {
+        "1L": "IL", "I1": "IL", "|L": "IL", "|1": "IL", "11": "IL",  # Illinois common OCR errors
+        "1N": "IN", "|N": "IN",  # Indiana
+        "1A": "IA", "|A": "IA",  # Iowa
+        "0H": "OH", "O1": "OH",  # Ohio
+        "0K": "OK",  # Oklahoma
+        "1D": "ID",  # Idaho
+        "1A": "IA",  # Iowa (duplicate but different context)
+    }
     
     # Mapping from full state names to abbreviations
     state_name_to_abbrev = {
@@ -474,8 +563,15 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
         if abbrev not in abbrev_to_state_name or len(name) > len(abbrev_to_state_name[abbrev]):
             abbrev_to_state_name[abbrev] = name
     
-    for pat, group_idx in state_patterns:
-        m = re.search(pat, text, re.MULTILINE)
+    for pattern_item in state_patterns:
+        # Handle both 2-tuple (pattern, group_idx) and 3-tuple (pattern, group_idx, flags)
+        if len(pattern_item) == 3:
+            pat, group_idx, flags = pattern_item
+        else:
+            pat, group_idx = pattern_item
+            flags = re.MULTILINE
+        
+        m = re.search(pat, text, flags)
         if m:
             state_candidate = m.group(group_idx).strip()
             state_candidate_upper = state_candidate.upper()
@@ -483,22 +579,28 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
             # Clean up the state candidate - remove extra whitespace
             state_candidate_upper = re.sub(r'\s+', ' ', state_candidate_upper)
             
+            # Apply OCR corrections for common misreadings
+            if state_candidate_upper in ocr_state_corrections:
+                state_candidate_upper = ocr_state_corrections[state_candidate_upper]
+            
             # If it's a 2-letter code, verify it's a valid state and convert to full name
-            if len(state_candidate_upper) == 2 and state_candidate_upper in us_states_abbrev:
-                # Convert abbreviation to full state name for output
-                full_name = abbrev_to_state_name.get(state_candidate_upper)
-                if full_name:
-                    results["state"] = full_name
-                else:
-                    # Fallback: if reverse mapping failed, try to find it manually
-                    for name, abbrev in state_name_to_abbrev.items():
-                        if abbrev == state_candidate_upper:
-                            results["state"] = name
-                            break
+            if len(state_candidate_upper) == 2:
+                # Check if it's a valid state abbreviation
+                if state_candidate_upper in us_states_abbrev:
+                    # Convert abbreviation to full state name for output
+                    full_name = abbrev_to_state_name.get(state_candidate_upper)
+                    if full_name:
+                        results["state"] = full_name
                     else:
-                        # Last resort: keep abbreviation (shouldn't happen)
-                        results["state"] = state_candidate_upper
-                break
+                        # Fallback: if reverse mapping failed, try to find it manually
+                        for name, abbrev in state_name_to_abbrev.items():
+                            if abbrev == state_candidate_upper:
+                                results["state"] = name
+                                break
+                        else:
+                            # Last resort: keep abbreviation (shouldn't happen)
+                            results["state"] = state_candidate_upper
+                    break
             # If it's a full state name, use it directly (normalize to uppercase key format)
             elif state_candidate_upper in state_name_to_abbrev:
                 results["state"] = state_candidate_upper
@@ -529,9 +631,27 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
                     break
                 break
     
+    # FALLBACK: If no state found yet, try to find any valid 2-letter state code in the text
+    # This catches cases where "IL" appears without matching the patterns above
+    if "state" not in results or not results["state"]:
+        # Look for all 2-letter codes in the text
+        all_two_letter_codes = re.findall(r'\b([A-Z0-9|]{2})\b', text.upper())
+        for code in all_two_letter_codes:
+            # Apply OCR corrections
+            corrected_code = ocr_state_corrections.get(code, code)
+            # Check if it's a valid state
+            if corrected_code in us_states_abbrev:
+                full_name = abbrev_to_state_name.get(corrected_code)
+                if full_name:
+                    results["state"] = full_name
+                    break
+    
     # Final conversion: if we somehow ended up with an abbreviation, convert it to full name
     if "state" in results and results["state"]:
         state_value = results["state"].upper().strip()
+        # Apply OCR corrections one more time
+        if state_value in ocr_state_corrections:
+            state_value = ocr_state_corrections[state_value]
         # Check if it's a 2-letter abbreviation
         if len(state_value) == 2 and state_value in abbrev_to_state_name:
             results["state"] = abbrev_to_state_name[state_value]

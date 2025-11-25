@@ -183,10 +183,24 @@ def main():
                 spec.loader.exec_module(ollama_mod)  # type: ignore
                 ollama_tab = ollama_mod.build_tab(notebook)  # type: ignore
                 notebook.add(ollama_tab, text="Ollama AI")
+            else:
+                # File doesn't exist
+                try:
+                    sys.stderr.write(f"OllamaTool.py not found at {ollama_path}\n")
+                except Exception:
+                    pass
         except Exception as e2:
-            # Silently fail for optional tab
+            # Show error message to help debug
             try:
-                sys.stderr.write(f"Ollama AI tab not available: {e}\n")
+                import traceback
+                error_details = f"Failed to load Ollama AI tab:\n\nPrimary error: {e}\n\nFallback error: {e2}\n\nTraceback:\n{traceback.format_exc()}"
+                sys.stderr.write(error_details + "\n")
+                # Show a messagebox so user knows what happened
+                try:
+                    messagebox.showwarning("Ollama AI Tab Unavailable", 
+                        f"Ollama AI tab could not be loaded:\n\n{str(e)}\n\nCheck console for details.")
+                except Exception:
+                    pass
             except Exception:
                 pass
 

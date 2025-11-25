@@ -418,7 +418,11 @@ def _extract_text_with_easyocr(file_path: str) -> str:
                     img_array = np.array(img)
                     
                     # Run OCR - EasyOCR returns [(bbox, text, confidence), ...]
-                    result = reader.readtext(img_array)
+                    # detail=1 returns detailed info with bboxes - needed for table detection
+                    # mag_ratio=1.5: Magnify image 1.5x to better detect small text like "IL"
+                    # min_size=10: Lower minimum text size to detect smaller text (default is 20)
+                    # width_ths and height_ths adjusted for better detection of short text
+                    result = reader.readtext(img_array, detail=1, mag_ratio=1.5, min_size=10, width_ths=0.3, height_ths=0.3)
                     if result:
                         page_text = "\n".join([line[1] for line in result if len(line) > 1])
                         if page_text.strip():
@@ -430,7 +434,11 @@ def _extract_text_with_easyocr(file_path: str) -> str:
             img_array = np.array(img)
             
             # Run OCR
-            result = reader.readtext(img_array)
+            # detail=1 returns detailed info with bboxes
+            # mag_ratio=1.5: Magnify image 1.5x to better detect small text like "IL"
+            # min_size=10: Lower minimum text size to detect smaller text (default is 20)
+            # width_ths and height_ths adjusted for better detection of short text
+            result = reader.readtext(img_array, detail=1, mag_ratio=1.5, min_size=10, width_ths=0.3, height_ths=0.3)
             if result:
                 text = "\n".join([line[1] for line in result if len(line) > 1])
                 if text.strip():
@@ -580,7 +588,11 @@ def extract_tables_from_pdf(file_path: str, use_ocr: bool = False) -> List[Dict]
                     
                     # Run OCR with table structure recognition
                     # EasyOCR returns: [(bbox, text, confidence), ...]
-                    result = reader.readtext(img_array)
+                    # detail=1 returns detailed info with bboxes - needed for table detection
+                    # mag_ratio=1.5: Magnify image 1.5x to better detect small text like "IL"
+                    # min_size=10: Lower minimum text size to detect smaller text (default is 20)
+                    # width_ths and height_ths adjusted for better detection of short text
+                    result = reader.readtext(img_array, detail=1, mag_ratio=1.5, min_size=10, width_ths=0.3, height_ths=0.3)
                     
                     if result:
                         # Try to detect table structure from OCR results
@@ -714,7 +726,11 @@ def extract_tables_from_pdf(file_path: str, use_ocr: bool = False) -> List[Dict]
                     
                     # Run OCR with table structure recognition
                     # EasyOCR returns: [(bbox, text, confidence), ...]
-                    result = reader.readtext(img_array)
+                    # detail=1 returns detailed info with bboxes - needed for table detection
+                    # mag_ratio=1.5: Magnify image 1.5x to better detect small text like "IL"
+                    # min_size=10: Lower minimum text size to detect smaller text (default is 20)
+                    # width_ths and height_ths adjusted for better detection of short text
+                    result = reader.readtext(img_array, detail=1, mag_ratio=1.5, min_size=10, width_ths=0.3, height_ths=0.3)
                     
                     if result:
                         # Try to detect table structure from OCR results
@@ -1318,19 +1334,146 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                                 
                                 # Apply state code fixes to all entries
                                 for idx, entry in enumerate(mvr_data_list, 1):
-                                    if 'state' in entry:
-                                        original_state = entry.get('state', '')
-                                        if original_state:
-                                            fixed_state = fix_state_code_in_data(entry['state'])
-                                            if fixed_state != original_state:
-                                                append_to_chat("system", f"Entry {idx}: Fixed state code: '{original_state}' → '{fixed_state}'")
-                                            entry['state'] = fixed_state
-                                        else:
-                                            # State is missing - try to find it in the cleaned text
-                                            append_to_chat("system", f"Entry {idx}: WARNING - State field is empty/missing")
-                                            # Log what the AI saw for this entry
-                                            name = f"{entry.get('first_name', '')} {entry.get('last_name', '')}".strip()
-                                            append_to_chat("system", f"  Entry data: {entry}")
+                                    # Check if state exists and is not empty
+                                    raw_state = entry.get('state', '')
+                                    if raw_state is None:
+                                        raw_state = ''
+                                    original_state = str(raw_state).strip() if raw_state else ''
+                                    append_to_chat("system", f"Entry {idx}: Raw state from AI: '{original_state}' (type: {type(raw_state).__name__})")
+                                    
+                                    if original_state:
+                                        fixed_state = fix_state_code_in_data(original_state)
+                                        if fixed_state != original_state:
+                                            append_to_chat("system", f"Entry {idx}: Fixed state code: '{original_state}' → '{fixed_state}'")
+                                        entry['state'] = fixed_state
+                                    else:
+                                        # State is missing - try to find it in the cleaned text
+                                        append_to_chat("system", f"Entry {idx}: WARNING - State field is empty/missing")
+                                        # Log what the AI saw for this entry
+                                        name = f"{entry.get('first_name', '')} {entry.get('last_name', '')}".strip()
+                                        append_to_chat("system", f"  Entry data: {entry}")
+                                        
+                                        # Try to find state in the text using fallback extraction
+                                        # Look for state codes near this entry's name or other fields
+                                        try:
+                                            # Import the state extraction function from MvrRunner
+                                            try:
+                                                from Tabs.MvrRunner import _parse_mvr_fields
+                                            except ImportError:
+                                                # Fallback import
+                                                import importlib.util
+                                                mvr_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Tabs", "MvrRunner.py")
+                                                if os.path.isfile(mvr_path):
+                                                    spec = importlib.util.spec_from_file_location("Tabs.MvrRunner", mvr_path)
+                                                    mvr_mod = importlib.util.module_from_spec(spec)
+                                                    if spec and spec.loader:
+                                                        spec.loader.exec_module(mvr_mod)
+                                                        _parse_mvr_fields = mvr_mod._parse_mvr_fields
+                                                else:
+                                                    raise ImportError("MvrRunner not found")
+                                            
+                                            # Create a context around this entry to search for state
+                                            # Look for text that includes the person's name or license number
+                                            search_context = ""
+                                            if name:
+                                                    # Find the name in the combined text and get surrounding context
+                                                    name_parts = name.split()
+                                                    if name_parts:
+                                                        # Search for first name or last name in text
+                                                        first_name = entry.get('first_name', '').strip()
+                                                        last_name = entry.get('last_name', '').strip()
+                                                        license_num = entry.get('license_number', '').strip()
+                                                        
+                                                        # Build search patterns
+                                                        search_patterns = []
+                                                        if first_name:
+                                                            search_patterns.append(re.escape(first_name))
+                                                        if last_name:
+                                                            search_patterns.append(re.escape(last_name))
+                                                        if license_num:
+                                                            search_patterns.append(re.escape(license_num))
+                                                        
+                                                        if search_patterns:
+                                                            # Find context around this entry (200 chars before and after)
+                                                            pattern = '|'.join(search_patterns)
+                                                            matches = list(re.finditer(pattern, combined_text, re.IGNORECASE))
+                                                            if matches:
+                                                                # Try each match to find the one with a state in its context
+                                                                found_state_for_entry = None
+                                                                for match_idx, match in enumerate(matches):
+                                                                    start = max(0, match.start() - 300)
+                                                                    end = min(len(combined_text), match.end() + 300)
+                                                                    search_context = combined_text[start:end]
+                                                                    
+                                                                    # Try to extract state from this specific context
+                                                                    context_results = _parse_mvr_fields(search_context)
+                                                                    if context_results.get('state'):
+                                                                        found_state_for_entry = context_results['state']
+                                                                        break  # Found state for this entry, stop searching
+                                                                
+                                                                if found_state_for_entry:
+                                                                    fixed_state = fix_state_code_in_data(found_state_for_entry)
+                                                                    entry['state'] = fixed_state
+                                                                    append_to_chat("system", f"  ✓ Found state in context: '{found_state_for_entry}' → '{fixed_state}'")
+                                                                else:
+                                                                    # No state found in any context - try to find state in same line/row
+                                                                    # Look for table structure: name and state on same line
+                                                                    for match in matches:
+                                                                        # Get the line containing this match
+                                                                        line_start = combined_text.rfind('\n', 0, match.start())
+                                                                        line_end = combined_text.find('\n', match.end())
+                                                                        if line_end == -1:
+                                                                            line_end = len(combined_text)
+                                                                        line_text = combined_text[line_start:line_end]
+                                                                        
+                                                                        # Look for state code in this line
+                                                                        state_in_line = re.search(r'\b([A-Z0-9|]{2})\b', line_text.upper())
+                                                                        if state_in_line:
+                                                                            potential_state = state_in_line.group(1)
+                                                                            # Check if it's a valid state (with OCR corrections)
+                                                                            fixed_potential = fix_state_code_in_data(potential_state)
+                                                                            # Verify it's a valid state code
+                                                                            valid_states = ["AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC"]
+                                                                            if fixed_potential in valid_states:
+                                                                                entry['state'] = fixed_potential
+                                                                                append_to_chat("system", f"  ✓ Found state in same line: '{potential_state}' → '{fixed_potential}'")
+                                                                                found_state_for_entry = fixed_potential
+                                                                                break
+                                                                    
+                                                                    if not found_state_for_entry:
+                                                                        # Last resort: search entire text for any state code
+                                                                        all_results = _parse_mvr_fields(combined_text)
+                                                                        if all_results.get('state'):
+                                                                            found_state = all_results['state']
+                                                                            fixed_state = fix_state_code_in_data(found_state)
+                                                                            entry['state'] = fixed_state
+                                                                            append_to_chat("system", f"  ⚠ Using state from full text (may not be entry-specific): '{found_state}' → '{fixed_state}'")
+                                                            else:
+                                                                # No name match - try full text search
+                                                                all_results = _parse_mvr_fields(combined_text)
+                                                                if all_results.get('state'):
+                                                                    found_state = all_results['state']
+                                                                    fixed_state = fix_state_code_in_data(found_state)
+                                                                    entry['state'] = fixed_state
+                                                                    append_to_chat("system", f"  ✓ Found state in full text (no name match): '{found_state}' → '{fixed_state}'")
+                                                        else:
+                                                            # No searchable fields - try full text
+                                                            all_results = _parse_mvr_fields(combined_text)
+                                                            if all_results.get('state'):
+                                                                found_state = all_results['state']
+                                                                fixed_state = fix_state_code_in_data(found_state)
+                                                                entry['state'] = fixed_state
+                                                                append_to_chat("system", f"  ✓ Found state in full text: '{found_state}' → '{fixed_state}'")
+                                            else:
+                                                # No name available - try full text search
+                                                all_results = _parse_mvr_fields(combined_text)
+                                                if all_results.get('state'):
+                                                    found_state = all_results['state']
+                                                    fixed_state = fix_state_code_in_data(found_state)
+                                                    entry['state'] = fixed_state
+                                                    append_to_chat("system", f"  ✓ Found state in full text (no name): '{found_state}' → '{fixed_state}'")
+                                        except Exception as fallback_err:
+                                            append_to_chat("system", f"  ⚠ Fallback state search failed: {str(fallback_err)[:100]}")
                                 
                                 # Log what was extracted for debugging
                                 append_to_chat("system", f"AI extracted {len(mvr_data_list)} entr{'y' if len(mvr_data_list) == 1 else 'ies'} from JSON")
@@ -1375,13 +1518,19 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                                                 if not name_info:
                                                     name_info = f"Entry {idx} (no name)"
                                                 
-                                                # Show full data being imported
+                                                # Show full data being imported - explicitly show state
+                                                state_before_import = mvr_data.get('state', '')
                                                 data_preview = {k: v for k, v in mvr_data.items() if v}
                                                 append_to_chat("system", f"Processing entry {idx}/{total_entries}: {name_info}")
-                                                append_to_chat("system", f"  Data: {data_preview}")
+                                                append_to_chat("system", f"  State before import: '{state_before_import}'")
+                                                append_to_chat("system", f"  Full data: {data_preview}")
+                                                
+                                                # Make a copy to avoid any mutation issues
+                                                import copy
+                                                mvr_data_copy = copy.deepcopy(mvr_data)
                                                 
                                                 try:
-                                                    success, message = callback(mvr_data, source="Ollama AI")
+                                                    success, message = callback(mvr_data_copy, source="Ollama AI")
                                                     if success:
                                                         imported_count += 1
                                                         append_to_chat("system", f"✓ Imported entry {idx}: {name_info}")
@@ -1756,7 +1905,12 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                             # EasyOCR returns: [(bbox, text, confidence), ...]
                             # bbox format: [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
                             # For better accuracy on short text, we can adjust parameters
-                            result = reader.readtext(img_array, paragraph=False)  # paragraph=False helps with short text
+                            # detail=1 returns detailed info with bboxes - needed for table detection
+                            # paragraph=False helps with short text
+                            # mag_ratio=1.5: Magnify image 1.5x to better detect small text like "IL"
+                            # min_size=10: Lower minimum text size to detect smaller text (default is 20)
+                            # width_ths and height_ths adjusted for better detection of short text
+                            result = reader.readtext(img_array, detail=1, paragraph=False, mag_ratio=1.5, min_size=10, width_ths=0.3, height_ths=0.3)
                             
                             if result:
                                 # Extract text - EasyOCR result structure is simpler
