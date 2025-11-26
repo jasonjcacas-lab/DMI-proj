@@ -2263,16 +2263,17 @@ def build_tab(parent):
     save_row.pack(fill="x")
     ttk.Button(save_row, text="Save", command=on_save, width=12).pack(side="left")
     
-    # Drag and drop handler - supports multiple files
+    # Drag and drop handler - supports multiple files (cross-platform: Windows & Linux)
     def on_drop(e):
         data = (e.data or "").strip()
         if not data:
             return
         
         file_paths = []
+        is_windows = os.name == 'nt'
         
         # Strategy 1: Handle curly braces format - each file wrapped in {}
-        # Pattern: {C:/path/to/file.pdf} or {C:\path\to\file.pdf}
+        # Pattern: {/path/to/file.pdf} or {C:\path\to\file.pdf}
         # Split by } { to separate multiple files
         if "{" in data and "}" in data:
             # Split by } followed by optional whitespace and {
@@ -2280,14 +2281,15 @@ def build_tab(parent):
             for part in parts:
                 # Remove leading { and trailing }
                 path = part.strip().strip('{').strip('}').strip()
-                # Normalize forward slashes to backslashes for Windows
+                # Only normalize slashes on Windows
+                if is_windows:
                 path = path.replace('/', '\\')
                 if path and os.path.isfile(path) and path.lower().endswith(".pdf"):
                     if path not in file_paths:
                         file_paths.append(path)
         
-        # Strategy 2: If no curly braces, try quoted paths
-        if not file_paths:
+        # Strategy 2: If no curly braces, try quoted paths (Windows style)
+        if not file_paths and is_windows:
             # Pattern 1: Quoted paths: "C:\path with spaces\file.pdf" or "C:/path/file.pdf"
             quoted_pattern = r'"([A-Za-z]:[^"]+\.pdf)"'
             quoted_matches = re.finditer(quoted_pattern, data, re.IGNORECASE)
@@ -2297,19 +2299,36 @@ def build_tab(parent):
                     if path not in file_paths:
                         file_paths.append(path)
         
-        # Strategy 3: Unquoted paths (no spaces): C:\path\to\file.pdf or C:/path/file.pdf
-        if not file_paths:
-            unquoted_pattern = r'(?:^|\s)([A-Za-z]:[^\s"]+\.pdf)(?=\s|$)'
-            unquoted_matches = re.finditer(unquoted_pattern, data, re.IGNORECASE)
-            for match in unquoted_matches:
-                path = match.group(1).strip().replace('/', '\\')
+        # Strategy 2b: Quoted Unix paths: "/path/to/file.pdf"
+        if not file_paths and not is_windows:
+            quoted_unix_pattern = r'"(/[^"]+\.pdf)"'
+            quoted_matches = re.finditer(quoted_unix_pattern, data, re.IGNORECASE)
+            for match in quoted_matches:
+                path = match.group(1)
                 if os.path.isfile(path) and path.lower().endswith(".pdf"):
                     if path not in file_paths:
                         file_paths.append(path)
         
-        # Strategy 4: Try as single file (fallback)
+        # Strategy 3: Unquoted paths (no spaces): C:\path\to\file.pdf or /path/to/file.pdf
         if not file_paths:
-            test_path = data.strip().strip('"').strip('{').strip('}').replace('/', '\\')
+            if is_windows:
+            unquoted_pattern = r'(?:^|\s)([A-Za-z]:[^\s"]+\.pdf)(?=\s|$)'
+            else:
+                unquoted_pattern = r'(?:^|\s)(/[^\s"]+\.pdf)(?=\s|$)'
+            unquoted_matches = re.finditer(unquoted_pattern, data, re.IGNORECASE)
+            for match in unquoted_matches:
+                path = match.group(1).strip()
+                if is_windows:
+                    path = path.replace('/', '\\')
+                if os.path.isfile(path) and path.lower().endswith(".pdf"):
+                    if path not in file_paths:
+                        file_paths.append(path)
+        
+        # Strategy 4: Try as single file (fallback - works for any OS)
+        if not file_paths:
+            test_path = data.strip().strip('"').strip('{').strip('}')
+            if is_windows:
+                test_path = test_path.replace('/', '\\')
             if os.path.isfile(test_path) and test_path.lower().endswith(".pdf"):
                 file_paths.append(test_path)
         
