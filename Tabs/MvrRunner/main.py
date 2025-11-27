@@ -57,7 +57,8 @@ try:
         _IMPORT_ERRORS, _SIZE_PRESETS, _DEFAULT_UI_SETTINGS, _DEFAULT_MVR_SETTINGS,
         _load_mvr_settings, _save_mvr_settings, _load_ui_settings, _save_ui_settings,
         _apply_display_size, _is_port_open, _is_chrome_running, _find_chrome_executable,
-        _get_chrome_user_data_dir, _extract_text_from_pdf, _parse_mvr_fields, format_dob_value, DND_FILES
+        _get_chrome_user_data_dir, _extract_text_from_pdf, _parse_mvr_fields, 
+        _parse_mvr_with_checkboxes, format_dob_value, DND_FILES
     )
     from .automation_core import (
         _ensure_playwright_browsers_installed, _fill_site_with_playwright, _run_mvr_automation,
@@ -73,7 +74,8 @@ except (ImportError, ValueError):
         _IMPORT_ERRORS, _SIZE_PRESETS, _DEFAULT_UI_SETTINGS, _DEFAULT_MVR_SETTINGS,
         _load_mvr_settings, _save_mvr_settings, _load_ui_settings, _save_ui_settings,
         _apply_display_size, _is_port_open, _is_chrome_running, _find_chrome_executable,
-        _get_chrome_user_data_dir, _extract_text_from_pdf, _parse_mvr_fields, format_dob_value, DND_FILES
+        _get_chrome_user_data_dir, _extract_text_from_pdf, _parse_mvr_fields,
+        _parse_mvr_with_checkboxes, format_dob_value, DND_FILES
     )
     from automation_core import (
         _ensure_playwright_browsers_installed, _fill_site_with_playwright, _run_mvr_automation,
@@ -1564,6 +1566,8 @@ def build_tab(parent):
                 "first_name": fields["first_name"].get().strip(),
                 "dob": dob_value,
                 "state": fields["state"].get().strip(),
+                "status": fields["status"].get().strip(),
+                "personal_use": fields["personal_use"].get().strip(),
                 "extracted_text": txt.get("1.0", "end-1c")
             }
             
@@ -1915,6 +1919,8 @@ def build_tab(parent):
         "first_name": tk.StringVar(),
         "dob": tk.StringVar(),
         "state": tk.StringVar(),
+        "status": tk.StringVar(),        # FT (Full-Time) or PT (Part-Time) - from checkbox
+        "personal_use": tk.StringVar(),  # Y (Yes) or N (No) - from checkbox
     }
     
     # Store copy buttons and field frames (for display size updates)
@@ -2103,7 +2109,8 @@ def build_tab(parent):
         return entry
     
     dob_entry = None
-    for label, key in [("License #", "license_number"), ("Last Name", "last_name"), ("First Name", "first_name"), ("DOB", "dob"), ("State", "state")]:
+    for label, key in [("License #", "license_number"), ("Last Name", "last_name"), ("First Name", "first_name"), 
+                       ("DOB", "dob"), ("State", "state"), ("Status", "status"), ("Personal Use", "personal_use")]:
         if key == "dob":
             dob_entry = row(fields_frame, label, fields[key], key, is_dob=True)
         else:
@@ -2124,6 +2131,8 @@ def build_tab(parent):
             "first_name": fields["first_name"].get().strip(),
             "dob": dob_value,
             "state": fields["state"].get().strip(),
+            "status": fields["status"].get().strip(),
+            "personal_use": fields["personal_use"].get().strip(),
             "extracted_text": txt.get("1.0", "end-1c")
         }
         
@@ -2219,8 +2228,9 @@ def build_tab(parent):
                 text = _extract_text_from_pdf(p)
                 txt.delete("1.0", "end")
                 txt.insert("1.0", text)
-                set_status("Parsing fields...")
-                parsed = _parse_mvr_fields(text)
+                set_status("Parsing fields (including checkboxes)...")
+                # Use checkbox-aware parsing for STATUS and PERSONAL USE fields
+                parsed = _parse_mvr_with_checkboxes(p)
                 for k, v in parsed.items():
                     if k in fields:
                         if k == "dob":
@@ -2408,11 +2418,11 @@ def build_tab(parent):
                         continue
                     
                     if filepath not in file_data:
-                        # Extract data for this file
+                        # Extract data for this file (with checkbox detection)
                         try:
                             set_status(f"Extracting: {os.path.basename(filepath)}...")
+                            parsed = _parse_mvr_with_checkboxes(filepath)
                             text = _extract_text_from_pdf(filepath)
-                            parsed = _parse_mvr_fields(text)
                             # Format DOB
                             if "dob" in parsed:
                                 parsed["dob"] = format_dob_value(parsed["dob"])
@@ -2423,6 +2433,8 @@ def build_tab(parent):
                                 "first_name": parsed.get("first_name", ""),
                                 "dob": parsed.get("dob", "").replace("_", ""),  # Clean DOB
                                 "state": parsed.get("state", ""),
+                                "status": parsed.get("status", ""),
+                                "personal_use": parsed.get("personal_use", ""),
                                 "extracted_text": text
                             }
                         except Exception as e:
@@ -2572,8 +2584,8 @@ def build_tab(parent):
                     text = _extract_text_from_pdf(p)
                     txt.delete("1.0", "end")
                     txt.insert("1.0", text)
-                    set_status("Parsing fields...")
-                    parsed = _parse_mvr_fields(text)
+                    set_status("Parsing fields (including checkboxes)...")
+                    parsed = _parse_mvr_with_checkboxes(p)
                     for k, v in parsed.items():
                         if k in fields:
                             if k == "dob":
@@ -2583,7 +2595,7 @@ def build_tab(parent):
                                 fields[k].set(v)
                     # Save extracted data
                     save_file_data(p)
-                    set_status("Auto-extracted and saved")
+                    set_status("Auto-extracted and saved (with checkboxes)")
                 except Exception as e:
                     set_status("Extraction Error")
                     messagebox.showerror("Extraction Error", str(e))

@@ -633,11 +633,146 @@ def format_dob_value(value):
     return formatted
 
 
+def _parse_mvr_with_checkboxes(pdf_path: str, page_num: int = 0) -> Dict[str, str]:
+    """
+    Extract MVR fields including checkbox-based STATUS and PERSONAL USE fields.
+    
+    This function:
+    1. Extracts text from PDF and parses standard fields (name, DOB, license, state)
+    2. Detects checkboxes in rightmost columns using OpenCV
+    3. Maps checkbox states to STATUS (FT/PT) and PERSONAL USE (Y/N)
+    
+    Args:
+        pdf_path: Path to the PDF file
+        page_num: Page number to scan (0-indexed)
+    
+    Returns:
+        Dict with all MVR fields including 'status' and 'personal_use'
+    """
+    # First, extract text-based fields
+    text = _extract_text_from_pdf(pdf_path)
+    results = _parse_mvr_fields(text)
+    
+    # Initialize checkbox fields with empty values
+    results['status'] = ''
+    results['personal_use'] = ''
+    
+    # Try to detect checkboxes in rightmost columns
+    try:
+        checkbox_rows = _detect_checkboxes_in_rightmost_columns(pdf_path, page_num, num_columns=2)
+        
+        if checkbox_rows:
+            # Analyze checkbox layout
+            # Typical MVR form has STATUS column (FT/PT) and PERSONAL USE column (Y/N)
+            # Each row should have 2-4 checkboxes: [FT] [PT] | [Y] [N]
+            
+            # Find the first row with enough checkboxes to analyze
+            for row in checkbox_rows:
+                if len(row) >= 2:
+                    # Sort by x-coordinate (left to right)
+                    sorted_boxes = sorted(row, key=lambda c: c['x'])
+                    
+                    # Determine midpoint to split into STATUS and PERSONAL columns
+                    if len(sorted_boxes) >= 4:
+                        # 4+ checkboxes: assume [FT][PT][Y][N] layout
+                        status_boxes = sorted_boxes[:2]
+                        personal_boxes = sorted_boxes[2:4]
+                    elif len(sorted_boxes) == 2:
+                        # 2 checkboxes: could be STATUS only or PERSONAL only
+                        # Check x-positions to determine which column
+                        page_width = _get_pdf_page_width(pdf_path, page_num)
+                        if page_width > 0:
+                            midpoint = page_width * 0.85  # STATUS usually at ~80%, PERSONAL at ~90%
+                            avg_x = sum(c['x'] for c in sorted_boxes) / len(sorted_boxes)
+                            if avg_x < midpoint:
+                                status_boxes = sorted_boxes
+                                personal_boxes = []
+                            else:
+                                status_boxes = []
+                                personal_boxes = sorted_boxes
+                        else:
+                            status_boxes = sorted_boxes
+                            personal_boxes = []
+                    else:
+                        # 3 checkboxes: [FT][PT][Y] or [FT][Y][N] - ambiguous
+                        status_boxes = sorted_boxes[:2]
+                        personal_boxes = sorted_boxes[2:]
+                    
+                    # Determine STATUS (FT vs PT)
+                    if len(status_boxes) >= 2:
+                        # Two boxes for status: first is FT, second is PT
+                        ft_checked = status_boxes[0].get('checked', False)
+                        pt_checked = status_boxes[1].get('checked', False)
+                        
+                        if ft_checked and not pt_checked:
+                            results['status'] = 'FT'
+                        elif pt_checked and not ft_checked:
+                            results['status'] = 'PT'
+                        elif ft_checked and pt_checked:
+                            # Both checked - use higher confidence
+                            if status_boxes[0].get('confidence', 0) > status_boxes[1].get('confidence', 0):
+                                results['status'] = 'FT'
+                            else:
+                                results['status'] = 'PT'
+                    elif len(status_boxes) == 1:
+                        # Single status checkbox - if checked, assume FT
+                        if status_boxes[0].get('checked', False):
+                            results['status'] = 'FT'
+                    
+                    # Determine PERSONAL USE (Y vs N)
+                    if len(personal_boxes) >= 2:
+                        # Two boxes for personal: first is Y, second is N
+                        y_checked = personal_boxes[0].get('checked', False)
+                        n_checked = personal_boxes[1].get('checked', False)
+                        
+                        if y_checked and not n_checked:
+                            results['personal_use'] = 'Y'
+                        elif n_checked and not y_checked:
+                            results['personal_use'] = 'N'
+                        elif y_checked and n_checked:
+                            # Both checked - use higher confidence
+                            if personal_boxes[0].get('confidence', 0) > personal_boxes[1].get('confidence', 0):
+                                results['personal_use'] = 'Y'
+                            else:
+                                results['personal_use'] = 'N'
+                    elif len(personal_boxes) == 1:
+                        # Single personal checkbox - if checked, assume Y
+                        if personal_boxes[0].get('checked', False):
+                            results['personal_use'] = 'Y'
+                        else:
+                            results['personal_use'] = 'N'
+                    
+                    # Found valid row, stop searching
+                    if results['status'] or results['personal_use']:
+                        break
+                        
+    except Exception as e:
+        print(f"Checkbox detection error in _parse_mvr_with_checkboxes: {e}")
+    
+    return results
+
+
+def _get_pdf_page_width(pdf_path: str, page_num: int = 0) -> int:
+    """Get the width of a PDF page in pixels (at 150 DPI)."""
+    if not fitz:
+        return 0
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc[page_num]
+        width = int(page.rect.width * 150 / 72)  # Convert points to pixels at 150 DPI
+        doc.close()
+        return width
+    except Exception:
+        return 0
+
+
 # Export shared constants and functions
 __all__ = [
     '_IMPORT_ERRORS', '_SIZE_PRESETS', '_DEFAULT_UI_SETTINGS', '_DEFAULT_MVR_SETTINGS',
     '_load_mvr_settings', '_save_mvr_settings', '_load_ui_settings', '_save_ui_settings',
     '_apply_display_size', '_is_port_open', '_is_chrome_running', '_find_chrome_executable',
-    '_get_chrome_user_data_dir', '_extract_text_from_pdf', '_parse_mvr_fields', 'format_dob_value', 'DND_FILES'
+    '_get_chrome_user_data_dir', '_extract_text_from_pdf', '_parse_mvr_fields', 
+    '_parse_mvr_with_checkboxes', '_detect_checkboxes_in_rightmost_columns',
+    'format_dob_value', 'DND_FILES'
 ]
 
