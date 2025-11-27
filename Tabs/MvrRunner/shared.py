@@ -372,9 +372,12 @@ def _detect_checkboxes_in_pdf(pdf_path: str, page_num: int = 0, region: Tuple[fl
             fill_ratio = dark_pixels / total_pixels
             
             # Determine if checked based on fill ratio
-            # Empty checkbox: ~0-15% fill, Checked: >25% fill
-            is_checked = fill_ratio > 0.20
-            confidence = min(1.0, fill_ratio * 2) if is_checked else min(1.0, (0.20 - fill_ratio) * 5)
+            # Empty checkbox: ~0-3% fill (just border)
+            # X-mark checkbox: ~5-15% fill (two diagonal lines)
+            # Filled checkbox: >20% fill
+            # Lowered threshold to detect X marks
+            is_checked = fill_ratio > 0.04  # 4% threshold to catch X marks
+            confidence = min(1.0, fill_ratio * 3) if is_checked else min(1.0, (0.10 - fill_ratio) * 10)
             
             checkboxes.append({
                 'x': x + offset_x,
