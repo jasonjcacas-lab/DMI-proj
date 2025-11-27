@@ -1286,6 +1286,8 @@ def build_tab(parent):
             "first_name": mvr_data.get("first_name", "").strip(),
             "dob": mvr_data.get("dob", "").strip().replace("_", ""),
             "state": mvr_data.get("state", "").strip(),
+            "status": mvr_data.get("status", "").strip(),
+            "personal_use": mvr_data.get("personal_use", "").strip(),
             "extracted_text": mvr_data.get("extracted_text", "")
         }
         
