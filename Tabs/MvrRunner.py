@@ -2283,7 +2283,7 @@ def build_tab(parent):
                 path = part.strip().strip('{').strip('}').strip()
                 # Only normalize slashes on Windows
                 if is_windows:
-                path = path.replace('/', '\\')
+                    path = path.replace('/', '\\')
                 if path and os.path.isfile(path) and path.lower().endswith(".pdf"):
                     if path not in file_paths:
                         file_paths.append(path)
@@ -2312,7 +2312,7 @@ def build_tab(parent):
         # Strategy 3: Unquoted paths (no spaces): C:\path\to\file.pdf or /path/to/file.pdf
         if not file_paths:
             if is_windows:
-            unquoted_pattern = r'(?:^|\s)([A-Za-z]:[^\s"]+\.pdf)(?=\s|$)'
+                unquoted_pattern = r'(?:^|\s)([A-Za-z]:[^\s"]+\.pdf)(?=\s|$)'
             else:
                 unquoted_pattern = r'(?:^|\s)(/[^\s"]+\.pdf)(?=\s|$)'
             unquoted_matches = re.finditer(unquoted_pattern, data, re.IGNORECASE)
