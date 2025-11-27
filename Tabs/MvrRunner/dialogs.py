@@ -13,13 +13,13 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 try:
-    # Try relative imports first (when loaded as Tabs.MvrRunner_UI_Dialogs)
-    from .MvrRunner_Shared import (
+    # Try relative imports first (when loaded as Tabs.MvrRunner package)
+    from .shared import (
         _load_mvr_settings, _save_mvr_settings
     )
 except (ImportError, ValueError):
     # Fallback for direct file execution
-    from MvrRunner_Shared import (
+    from shared import (
         _load_mvr_settings, _save_mvr_settings
     )
 

@@ -69,7 +69,8 @@ except ImportError:
 
 # ------------------ Paths ------------------
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_THIS_DIR)
+_TABS_DIR = os.path.dirname(_THIS_DIR)
+_PROJECT_ROOT = os.path.dirname(_TABS_DIR)
 _SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "ollama_settings.json")
 
 # Default settings
@@ -1358,19 +1359,19 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                                         try:
                                             # Import the state extraction function from MvrRunner
                                             try:
-                                                from Tabs.MvrRunner import _parse_mvr_fields
+                                                from Tabs.MvrRunner.shared import _parse_mvr_fields
                                             except ImportError:
                                                 # Fallback import
                                                 import importlib.util
-                                                mvr_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "Tabs", "MvrRunner.py")
+                                                mvr_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "MvrRunner", "shared.py")
                                                 if os.path.isfile(mvr_path):
-                                                    spec = importlib.util.spec_from_file_location("Tabs.MvrRunner", mvr_path)
+                                                    spec = importlib.util.spec_from_file_location("Tabs.MvrRunner.shared", mvr_path)
                                                     mvr_mod = importlib.util.module_from_spec(spec)
                                                     if spec and spec.loader:
                                                         spec.loader.exec_module(mvr_mod)
                                                         _parse_mvr_fields = mvr_mod._parse_mvr_fields
                                                 else:
-                                                    raise ImportError("MvrRunner not found")
+                                                    raise ImportError("MvrRunner shared module not found")
                                             
                                             # Create a context around this entry to search for state
                                             # Look for text that includes the person's name or license number

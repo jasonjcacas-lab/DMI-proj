@@ -9,14 +9,120 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import socket
 
-# Import shared utilities
-from MvrRunner_Shared import (
-    _IMPORT_ERRORS, _SIZE_PRESETS, _DEFAULT_UI_SETTINGS,
-    _load_mvr_settings, _save_mvr_settings, _load_ui_settings, _save_ui_settings,
-    _apply_display_size, _extract_text_from_pdf, _parse_mvr_fields, format_dob_value, DND_FILES
-)
+# Optional, show clear error if missing dependencies at runtime
+_IMPORT_ERRORS = []
+try:
+    import fitz  # PyMuPDF
+except Exception as e:
+    _IMPORT_ERRORS.append(("PyMuPDF (fitz)", str(e)))
+    fitz = None  # type: ignore
 
-# Note: Automation functions are not imported as this is Copy-Paste mode only
+try:
+    from playwright.sync_api import sync_playwright
+except Exception as e:
+    _IMPORT_ERRORS.append(("playwright", str(e)))
+    sync_playwright = None  # type: ignore
+
+try:
+    from legacy_form_helpers import set_select_dropdown_value, fill_text_input
+except Exception as e:
+    _IMPORT_ERRORS.append(("legacy_form_helpers", str(e)))
+    set_select_dropdown_value = None  # type: ignore
+    fill_text_input = None  # type: ignore
+
+try:
+    import psutil  # process detection
+except Exception as e:
+    _IMPORT_ERRORS.append(("psutil", str(e)))
+    psutil = None  # type: ignore
+
+try:
+    from tkinterdnd2 import DND_FILES
+except Exception as e:
+    _IMPORT_ERRORS.append(("tkinterdnd2", str(e)))
+    DND_FILES = None  # type: ignore
+
+# Import from refactored modules (now in same package)
+import os
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_TABS_DIR = os.path.dirname(_THIS_DIR)
+_PROJECT_ROOT = os.path.dirname(_TABS_DIR)
+
+if _THIS_DIR not in sys.path:
+    sys.path.insert(0, _THIS_DIR)
+
+try:
+    # Try relative imports first (when loaded as Tabs.MvrRunner)
+    from .shared import (
+        _IMPORT_ERRORS, _SIZE_PRESETS, _DEFAULT_UI_SETTINGS, _DEFAULT_MVR_SETTINGS,
+        _load_mvr_settings, _save_mvr_settings, _load_ui_settings, _save_ui_settings,
+        _apply_display_size, _is_port_open, _is_chrome_running, _find_chrome_executable,
+        _get_chrome_user_data_dir, _extract_text_from_pdf, _parse_mvr_fields, format_dob_value, DND_FILES
+    )
+    from .automation_core import (
+        _ensure_playwright_browsers_installed, _fill_site_with_playwright, _run_mvr_automation,
+        _add_stealth_script,
+        _launch_chrome_with_profile_for_mvr, _launch_chrome_with_profile
+    )
+    from .dialogs import (
+        show_site_automation_dialog, show_login_settings_dialog
+    )
+except (ImportError, ValueError):
+    # Fallback for direct file execution (when Tabs is not a package)
+    from shared import (
+        _IMPORT_ERRORS, _SIZE_PRESETS, _DEFAULT_UI_SETTINGS, _DEFAULT_MVR_SETTINGS,
+        _load_mvr_settings, _save_mvr_settings, _load_ui_settings, _save_ui_settings,
+        _apply_display_size, _is_port_open, _is_chrome_running, _find_chrome_executable,
+        _get_chrome_user_data_dir, _extract_text_from_pdf, _parse_mvr_fields, format_dob_value, DND_FILES
+    )
+    from automation_core import (
+        _ensure_playwright_browsers_installed, _fill_site_with_playwright, _run_mvr_automation,
+        _add_stealth_script,
+        _launch_chrome_with_profile_for_mvr, _launch_chrome_with_profile
+    )
+    from dialogs import (
+        show_site_automation_dialog, show_login_settings_dialog
+    )
+
+# MVR Settings file paths
+_MVR_SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "mvr_settings.json")
+_MVR_UI_SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "mvr_ui_settings.json")
+
+# Display size presets (similar to Binder Splitter)
+_SIZE_PRESETS = {
+    "Small": {"font_size": 9, "button_padding": 2},
+    "Medium": {"font_size": 10, "button_padding": 4},
+    "Large": {"font_size": 11, "button_padding": 6},
+}
+_DEFAULT_UI_SETTINGS = {"display_size": "Medium", "directions_collapsed": False, "copy_paste_mode": False}
+
+_DEFAULT_MVR_SETTINGS = {
+    "url": "https://example.com/",
+    "selectors": {
+        "license_number": "input[name='license']",
+        "last_name": "input[name='lastName']",
+        "first_name": "input[name='firstName']",
+        "dob": "input[name='dob']",
+        "state": "#ddComboState",
+        "order_type": "#OrderTypeCombo",  # ID selector for faster access
+        "product": "#ProductTypeCombo",  # ID selector for faster access
+        "purpose": "select[name='purposeCode']",  # Purpose dropdown - will select "Insurance"
+    },
+    "use_existing_chrome": True,
+    "debug_port": "9222",
+    "account_id": "",
+    "user_id": "",
+    "password": "",
+    "auto_click_recaptcha": True,  # Enable/disable automatic "I'm not a robot" clicking
+    "login_selectors": {
+        "account_id": "",
+        "user_id": "",
+        "password": "",
+    },
+}
+
+
+def _load_mvr_settings():
     """Load MVR settings from file"""
     try:
         if os.path.isfile(_MVR_SETTINGS_PATH):
@@ -215,22 +321,95 @@ def _find_chrome_executable():
 def _extract_text_from_pdf(pdf_path: str) -> str:
     """
     Fast extraction for text-based PDFs using PyMuPDF.
+    Enhanced to better handle tables and provide OCR fallback.
     """
     if not fitz:
         raise RuntimeError("PyMuPDF is not installed. Please install 'pymupdf'.")
     doc = fitz.open(pdf_path)
     try:
-        parts = []
-        for page in doc:
-            # Use blocks to preserve reading order better than plain text
-            parts.append(page.get_text("blocks"))
-        # Flatten blocks into lines; each block is a tuple (x0, y0, x1, y1, text, block_no, block_type)
-        lines = []
-        for blocks in parts:
+        all_text_parts = []
+        
+        for page_num, page in enumerate(doc):
+            # Method 1: Try native text extraction with blocks (preserves table structure)
+            blocks = page.get_text("blocks")
+            page_lines = []
             for b in blocks:
                 if len(b) >= 5 and isinstance(b[4], str):
-                    lines.append(b[4].strip())
-        return "\n".join([ln for ln in lines if ln])
+                    text = b[4].strip()
+                    if text:
+                        page_lines.append(text)
+            
+            # Method 2: Also try "dict" format which preserves table structure better
+            # This gives us more precise positioning info
+            try:
+                text_dict = page.get_text("dict")
+                # Extract text from dict format, preserving spatial relationships
+                dict_lines = []
+                for block in text_dict.get("blocks", []):
+                    if "lines" in block:
+                        for line in block["lines"]:
+                            line_text = ""
+                            for span in line.get("spans", []):
+                                span_text = span.get("text", "").strip()
+                                if span_text:
+                                    line_text += span_text + " "
+                            if line_text.strip():
+                                dict_lines.append(line_text.strip())
+                # Use dict format if it found more text or if blocks found very little
+                if len(dict_lines) > len(page_lines) * 0.8 or len(page_lines) < 10:
+                    page_lines = dict_lines
+            except Exception:
+                pass  # Fallback to blocks if dict fails
+            
+            # Method 3: Try "words" format for table-like structures
+            # This can help when text is in table cells
+            if len(page_lines) < 5:  # If we got very little text, try words format
+                try:
+                    words = page.get_text("words")
+                    # Group words by approximate y-coordinate (same row)
+                    rows = {}
+                    for word in words:
+                        if len(word) >= 5:
+                            y = round(word[1] / 5) * 5  # Round to nearest 5 pixels
+                            if y not in rows:
+                                rows[y] = []
+                            rows[y].append((word[4], word[0]))  # (text, x-coord)
+                    
+                    # Sort by y, then by x within each row
+                    word_lines = []
+                    for y in sorted(rows.keys()):
+                        row_words = sorted(rows[y], key=lambda w: w[1])
+                        row_text = " ".join(w[0] for w in row_words).strip()
+                        if row_text:
+                            word_lines.append(row_text)
+                    
+                    if len(word_lines) > len(page_lines):
+                        page_lines = word_lines
+                except Exception:
+                    pass
+            
+            all_text_parts.extend(page_lines)
+        
+        extracted_text = "\n".join([ln for ln in all_text_parts if ln])
+        
+        # If we got very little text, it might be a scanned PDF - try OCR fallback
+        if len(extracted_text.strip()) < 50:
+            try:
+                import pytesseract
+                from PIL import Image
+                import io
+                
+                # Try OCR on first page
+                first_page = doc[0]
+                pix = first_page.get_pixmap(dpi=300)
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                ocr_text = pytesseract.image_to_string(img, config="--oem 1 --psm 6")
+                if len(ocr_text.strip()) > len(extracted_text.strip()):
+                    extracted_text = ocr_text + "\n" + extracted_text
+            except Exception:
+                pass  # OCR not available or failed
+        
+        return extracted_text
     finally:
         doc.close()
 
@@ -324,25 +503,41 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
     # State - try multiple patterns
     # US state abbreviations (2 letters) and full state names
     state_patterns = [
-        # HIGHEST PRIORITY: SambaSafety format - "[State Name] Driver Record - [Account ID]"
+        # HIGHEST PRIORITY: Table format - "STATE" header followed by state codes
+        # This handles the case where STATE is a column header and IL appears below it
+        (r"(?i)^\s*STATE\s*$.*?^\s*([A-Z0-9|]{2})\s*$", 1, re.MULTILINE | re.DOTALL),  # STATE header on one line, code on next
+        (r"(?i)\bSTATE\s+([A-Z0-9|]{2})\b", 1),  # STATE followed immediately by code
+        (r"(?i)\bSTATE\s*:?\s*([A-Z0-9|]{2})\b", 1),  # STATE: followed by code
+        # HIGH PRIORITY: SambaSafety format - "[State Name] Driver Record - [Account ID]"
         (r"(?i)^\s*([A-Z][A-Z\s]+?)\s+Driver\s+Record\s*-\s*[A-Z0-9]+\s*$", 1),  # Full state name before "Driver Record -"
         (r"(?i)([A-Z][A-Z\s]+?)\s+Driver\s+Record\s*-\s*[A-Z0-9]+", 1),  # Full state name before "Driver Record -" (anywhere in text)
         # Patterns with explicit "State" label
-        (r"(?i)\b(State|State\s+of\s+Issue|Issuing\s+State|License\s+State|State\s+Code)\s*:?\s*([A-Z]{2})\b", 2),  # 2-letter abbreviation with label
+        (r"(?i)\b(State|State\s+of\s+Issue|Issuing\s+State|License\s+State|State\s+Code)\s*:?\s*([A-Z0-9|]{2})\b", 2),  # 2-letter abbreviation with label
         (r"(?i)\b(State|State\s+of\s+Issue|Issuing\s+State|License\s+State|State\s+Code)\s*:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b", 2),  # Full state name with label
         # Patterns without explicit label (context-based)
-        (r"\b([A-Z]{2})\s+(?:Driver|License|DL|MVR|Drivers?)\b", 1),  # State abbreviation before "Driver" or "License"
-        (r"\b(?:Driver|License|DL|MVR|Drivers?)\s+([A-Z]{2})\b", 1),  # State abbreviation after "Driver" or "License"
-        (r"\b([A-Z]{2})\s+[0-9]{4,}\b", 1),  # State abbreviation followed by numbers (likely license number)
+        (r"\b([A-Z0-9|]{2})\s+(?:Driver|License|DL|MVR|Drivers?)\b", 1),  # State abbreviation before "Driver" or "License"
+        (r"\b(?:Driver|License|DL|MVR|Drivers?)\s+([A-Z0-9|]{2})\b", 1),  # State abbreviation after "Driver" or "License"
+        (r"\b([A-Z0-9|]{2})\s+[0-9]{4,}\b", 1),  # State abbreviation followed by numbers (likely license number)
         # Standalone state abbreviations in common contexts
-        (r"(?i)\b(State|State\s+Code)\s*:?\s*([A-Z]{2})\b", 2),  # Just "State:" or "State Code:" followed by abbreviation
+        (r"(?i)\b(State|State\s+Code)\s*:?\s*([A-Z0-9|]{2})\b", 2),  # Just "State:" or "State Code:" followed by abbreviation
         (r"(?i)\b(State|State\s+Code)\s*:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b", 2),  # Just "State:" or "State Code:" followed by full name
         # Look for state names/abbreviations near other license fields
-        (r"(?i)(?:License|DL|MVR|Driver).*?(?:State|State\s+of\s+Issue|Issuing\s+State)\s*:?\s*([A-Z]{2})\b", 1),  # State abbrev near license keywords
+        (r"(?i)(?:License|DL|MVR|Driver).*?(?:State|State\s+of\s+Issue|Issuing\s+State)\s*:?\s*([A-Z0-9|]{2})\b", 1),  # State abbrev near license keywords
         (r"(?i)(?:License|DL|MVR|Driver).*?(?:State|State\s+of\s+Issue|Issuing\s+State)\s*:?\s*([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)\b", 1),  # State name near license keywords
     ]
     # Also check for common state abbreviations in context
     us_states_abbrev = ["AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "DC"]
+    
+    # OCR error corrections for state codes (common misreadings)
+    ocr_state_corrections = {
+        "1L": "IL", "I1": "IL", "|L": "IL", "|1": "IL", "11": "IL",  # Illinois common OCR errors
+        "1N": "IN", "|N": "IN",  # Indiana
+        "1A": "IA", "|A": "IA",  # Iowa
+        "0H": "OH", "O1": "OH",  # Ohio
+        "0K": "OK",  # Oklahoma
+        "1D": "ID",  # Idaho
+        "1A": "IA",  # Iowa (duplicate but different context)
+    }
     
     # Mapping from full state names to abbreviations
     state_name_to_abbrev = {
@@ -359,8 +554,23 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
         "DISTRICT OF COLUMBIA": "DC", "WASHINGTON DC": "DC", "DC": "DC"
     }
     
-    for pat, group_idx in state_patterns:
-        m = re.search(pat, text, re.MULTILINE)
+    # Reverse mapping from abbreviations to full state names (for output)
+    # Prioritize full state names over shorter variants (e.g., "DISTRICT OF COLUMBIA" over "DC")
+    abbrev_to_state_name = {}
+    for name, abbrev in state_name_to_abbrev.items():
+        # Only update if we don't have a mapping yet, or if the new name is longer (more specific)
+        if abbrev not in abbrev_to_state_name or len(name) > len(abbrev_to_state_name[abbrev]):
+            abbrev_to_state_name[abbrev] = name
+    
+    for pattern_item in state_patterns:
+        # Handle both 2-tuple (pattern, group_idx) and 3-tuple (pattern, group_idx, flags)
+        if len(pattern_item) == 3:
+            pat, group_idx, flags = pattern_item
+        else:
+            pat, group_idx = pattern_item
+            flags = re.MULTILINE
+        
+        m = re.search(pat, text, flags)
         if m:
             state_candidate = m.group(group_idx).strip()
             state_candidate_upper = state_candidate.upper()
@@ -368,13 +578,31 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
             # Clean up the state candidate - remove extra whitespace
             state_candidate_upper = re.sub(r'\s+', ' ', state_candidate_upper)
             
-            # If it's a 2-letter code, verify it's a valid state
-            if len(state_candidate_upper) == 2 and state_candidate_upper in us_states_abbrev:
-                results["state"] = state_candidate_upper
-                break
-            # If it's a full state name, convert to abbreviation
+            # Apply OCR corrections for common misreadings
+            if state_candidate_upper in ocr_state_corrections:
+                state_candidate_upper = ocr_state_corrections[state_candidate_upper]
+            
+            # If it's a 2-letter code, verify it's a valid state and convert to full name
+            if len(state_candidate_upper) == 2:
+                # Check if it's a valid state abbreviation
+                if state_candidate_upper in us_states_abbrev:
+                    # Convert abbreviation to full state name for output
+                    full_name = abbrev_to_state_name.get(state_candidate_upper)
+                    if full_name:
+                        results["state"] = full_name
+                    else:
+                        # Fallback: if reverse mapping failed, try to find it manually
+                        for name, abbrev in state_name_to_abbrev.items():
+                            if abbrev == state_candidate_upper:
+                                results["state"] = name
+                                break
+                        else:
+                            # Last resort: keep abbreviation (shouldn't happen)
+                            results["state"] = state_candidate_upper
+                    break
+            # If it's a full state name, use it directly (normalize to uppercase key format)
             elif state_candidate_upper in state_name_to_abbrev:
-                results["state"] = state_name_to_abbrev[state_candidate_upper]
+                results["state"] = state_candidate_upper
                 break
             # Try exact match first (for multi-word states like "NEW YORK")
             else:
@@ -382,7 +610,7 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
                 matched = False
                 for state_name, abbrev in state_name_to_abbrev.items():
                     if state_candidate_upper == state_name:
-                        results["state"] = abbrev
+                        results["state"] = state_name
                         matched = True
                         break
                 
@@ -394,7 +622,7 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
                         if state_name.startswith(state_candidate_upper) or state_candidate_upper in state_name:
                             # Make sure it's a reasonable match (not too short)
                             if len(state_candidate_upper) >= 3:  # At least 3 characters to avoid false matches
-                                results["state"] = abbrev
+                                results["state"] = state_name
                                 matched = True
                                 break
                 
@@ -402,11 +630,372 @@ def _parse_mvr_fields(text: str) -> Dict[str, str]:
                     break
                 break
     
+    # FALLBACK: If no state found yet, try to find any valid 2-letter state code in the text
+    # This catches cases where "IL" appears without matching the patterns above
+    if "state" not in results or not results["state"]:
+        # Look for all 2-letter codes in the text
+        all_two_letter_codes = re.findall(r'\b([A-Z0-9|]{2})\b', text.upper())
+        for code in all_two_letter_codes:
+            # Apply OCR corrections
+            corrected_code = ocr_state_corrections.get(code, code)
+            # Check if it's a valid state
+            if corrected_code in us_states_abbrev:
+                full_name = abbrev_to_state_name.get(corrected_code)
+                if full_name:
+                    results["state"] = full_name
+                    break
+    
+    # Final conversion: if we somehow ended up with an abbreviation, convert it to full name
+    if "state" in results and results["state"]:
+        state_value = results["state"].upper().strip()
+        # Apply OCR corrections one more time
+        if state_value in ocr_state_corrections:
+            state_value = ocr_state_corrections[state_value]
+        # Check if it's a 2-letter abbreviation
+        if len(state_value) == 2 and state_value in abbrev_to_state_name:
+            results["state"] = abbrev_to_state_name[state_value]
+    
     return results
 
 
+# Automation functions moved to MvrRunner_AutomationCore.py
+# Browser utilities moved to MvrRunner_BrowserUtils.py
+# Settings functions moved to MvrRunner_Shared.py
 
 
+# Duplicate build_tab removed - real one is below
+    if sync_playwright is None:
+        raise RuntimeError("playwright is not installed. Run: pip install playwright && playwright install")
+    try:
+        with sync_playwright() as p:
+            # Try launching quickly; if missing browsers, it will throw
+            browser = p.chromium.launch(headless=True)
+            browser.close()
+    except Exception:
+        # Try to install browsers
+        if status_cb:
+            status_cb("Installing Playwright browsers (one-time)...")
+        # Fallback: use Python API to install via CLI module
+        import subprocess, sys
+        try:
+            subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except Exception as e:
+            raise RuntimeError(f"Failed to install Playwright browsers: {e}")
+
+
+def _get_chrome_user_data_dir():
+    """Get the Chrome user data directory for the current user"""
+    if os.name == 'nt':  # Windows
+        user_data_dir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Google', 'Chrome', 'User Data')
+    else:  # macOS/Linux
+        if os.name == 'posix':
+            home = os.environ.get('HOME', '')
+            if sys.platform == 'darwin':  # macOS
+                user_data_dir = os.path.join(home, 'Library', 'Application Support', 'Google', 'Chrome')
+            else:  # Linux
+                user_data_dir = os.path.join(home, '.config', 'google-chrome')
+        else:
+            user_data_dir = None
+    return user_data_dir if user_data_dir and os.path.exists(user_data_dir) else None
+
+def _add_stealth_script(context):
+    """Add stealth script to hide automation"""
+    context.add_init_script("""
+        // Remove webdriver property completely
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined
+        });
+        
+        // Override plugins to look more realistic
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => [1, 2, 3, 4, 5]
+        });
+        
+        // Override languages
+        Object.defineProperty(navigator, 'languages', {
+            get: () => ['en-US', 'en']
+        });
+        
+        // Mock chrome object
+        window.chrome = {
+            runtime: {}
+        };
+        
+        // Remove automation indicators
+        delete navigator.__proto__.webdriver;
+        
+        // Override permissions
+        const originalQuery = window.navigator.permissions.query;
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications' ?
+                Promise.resolve({ state: Notification.permission }) :
+                originalQuery(parameters)
+        );
+        
+        // Override getParameter to hide automation
+        const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) {
+                return 'Intel Inc.';
+            }
+            if (parameter === 37446) {
+                return 'Intel Iris OpenGL Engine';
+            }
+            return originalGetParameter.call(this, parameter);
+        };
+        
+        // Override toString to hide automation
+        const originalToString = Function.prototype.toString;
+        Function.prototype.toString = function() {
+            if (this === navigator.webdriver) {
+                return 'function webdriver() { [native code] }';
+            }
+            return originalToString.call(this);
+        };
+    """)
+
+def _launch_chrome_with_profile_for_mvr(p, status_cb):
+    """Launch Chrome using the user's profile directory to access saved passwords and login sessions"""
+    user_data_dir = _get_chrome_user_data_dir()
+    
+    if not user_data_dir:
+        if status_cb:
+            status_cb("Chrome profile not found. Will launch Chrome without saved passwords...")
+        return None
+    
+    # Check if Chrome is already running - if so, we can't use the profile
+    if _is_chrome_running():
+        if status_cb:
+            status_cb("Chrome is already running. Cannot use profile (would conflict).")
+            status_cb("Close Chrome and try again, or use CDP connection with remote debugging.")
+        return None
+    
+    if status_cb:
+        status_cb(f"Using your Chrome profile: {user_data_dir}")
+        status_cb("This will use your saved passwords and login sessions!")
+    
+    try:
+        # Try method 1: launch_persistent_context (preferred for profile access)
+        try:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                channel="chrome",
+                headless=False,
+                viewport={"width": 1280, "height": 720},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-US",
+                timezone_id="America/Los_Angeles",
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-site-isolation-trials",
+                ],
+                ignore_default_args=["--enable-automation"],  # Remove automation flag
+            )
+            _add_stealth_script(context)
+            if status_cb:
+                status_cb("âœ“ Chrome launched with your profile (persistent context) - saved passwords available!")
+            return context
+        except Exception as e1:
+            if status_cb:
+                status_cb(f"Persistent context failed: {str(e1)[:100]}")
+                status_cb("Trying alternative method with user-data-dir argument...")
+            
+            # Method 2: Regular launch with user-data-dir argument (alternative approach)
+            browser = p.chromium.launch(
+                channel="chrome",
+                headless=False,
+                args=[
+                    f"--user-data-dir={user_data_dir}",
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-web-security",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-site-isolation-trials",
+                ],
+                ignore_default_args=["--enable-automation"],
+            )
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-US",
+                timezone_id="America/Los_Angeles",
+            )
+            _add_stealth_script(context)
+            if status_cb:
+                status_cb("âœ“ Chrome launched with your profile (user-data-dir) - saved passwords available!")
+            return context
+    except Exception as e:
+        if status_cb:
+            status_cb(f"Could not use Chrome profile: {str(e)[:100]}")
+            status_cb("Will launch Chrome without profile...")
+        return None
+
+def _launch_chrome_with_profile(p, status_cb, url=None, field_to_selector=None, data=None):
+    """Launch Chrome using the user's profile directory to access saved passwords"""
+    user_data_dir = _get_chrome_user_data_dir()
+    
+    if user_data_dir:
+        if status_cb:
+            status_cb(f"Using your Chrome profile: {user_data_dir}")
+        try:
+            # Use launch_persistent_context to use the actual Chrome profile
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=user_data_dir,
+                channel="chrome",
+                headless=False,
+                viewport={"width": 1280, "height": 720},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                locale="en-US",
+                timezone_id="America/Los_Angeles",
+            )
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                window.chrome = { runtime: {} };
+            """)
+            if url and field_to_selector and data:
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(url, wait_until="load")
+                if status_cb:
+                    status_cb("Filling form fields...")
+                for field_name, selector in field_to_selector.items():
+                    if selector and data.get(field_name):
+                        try:
+                            page.fill(selector, data[field_name])
+                        except Exception:
+                            pass
+                if status_cb:
+                    status_cb("Form filled. Please review and submit manually.")
+            else:
+                if status_cb:
+                    status_cb("Chrome launched with your profile. You can now use saved passwords.")
+            return context
+        except Exception as e:
+            if status_cb:
+                status_cb(f"Could not use Chrome profile (Chrome may be running): {str(e)[:100]}")
+                status_cb("Launching Chrome without profile...")
+            # Fall through to regular launch
+    else:
+        if status_cb:
+            status_cb("Chrome profile not found. Launching Chrome without saved passwords...")
+    
+    # Fallback: launch Chrome without profile
+    browser = p.chromium.launch(headless=False, channel="chrome")
+    context = browser.new_context(
+        viewport={"width": 1280, "height": 720},
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        locale="en-US",
+        timezone_id="America/Los_Angeles",
+    )
+    context.add_init_script("""
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        window.chrome = { runtime: {} };
+    """)
+    if url and field_to_selector and data:
+        page = context.new_page()
+        page.goto(url, wait_until="load")
+        if status_cb:
+            status_cb("Filling form fields...")
+        for field_name, selector in field_to_selector.items():
+            if selector and data.get(field_name):
+                try:
+                    page.fill(selector, data[field_name])
+                except Exception:
+                    pass
+        if status_cb:
+            status_cb("Form filled. Please review and submit manually.")
+    return context
+
+def _fill_site_with_playwright(url: str, field_to_selector: Dict[str, str], data: Dict[str, str], status_cb=None, cdp_endpoint: Optional[str] = None) -> None:
+    """
+    Open Chromium and fill fields per provided CSS selectors.
+    If cdp_endpoint is provided and reachable, attach to an existing Chrome via CDP.
+    """
+    if status_cb:
+        status_cb("Starting browser...")
+    with sync_playwright() as p:
+        browser = None
+        context = None
+        if cdp_endpoint and _is_port_open("127.0.0.1", int(cdp_endpoint.rsplit(":", 1)[-1])):
+            try:
+                browser = p.chromium.connect_over_cdp(cdp_endpoint)
+                # reuse an existing context if available; otherwise create one
+                if browser.contexts:
+                    context = browser.contexts[0]
+                    # Add stealth script to existing context
+                    try:
+                        context.add_init_script("""
+                            Object.defineProperty(navigator, 'webdriver', {
+                                get: () => undefined
+                            });
+                            Object.defineProperty(navigator, 'plugins', {
+                                get: () => [1, 2, 3, 4, 5]
+                            });
+                            Object.defineProperty(navigator, 'languages', {
+                                get: () => ['en-US', 'en']
+                            });
+                            window.chrome = { runtime: {} };
+                        """)
+                    except:
+                        pass  # If context already has pages, init script might fail
+                else:
+                    context = browser.new_context(
+                        viewport={"width": 1280, "height": 720},
+                        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        locale="en-US",
+                        timezone_id="America/Los_Angeles",
+                    )
+                    context.add_init_script("""
+                        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                        window.chrome = { runtime: {} };
+                    """)
+                if status_cb:
+                    status_cb("Attached to existing Chrome via CDP.")
+            except Exception:
+                # fallback to launching - use system Chrome with your profile
+                _launch_chrome_with_profile(p, status_cb)
+                return  # _launch_chrome_with_profile handles everything
+        else:
+            # Use system Chrome with your profile (saved passwords and login sessions)
+            _launch_chrome_with_profile(p, status_cb, url, field_to_selector, data)
+            return  # _launch_chrome_with_profile handles everything
+        page = context.new_page()
+        page.goto(url, wait_until="load")
+        if status_cb:
+            status_cb("Page loaded. Filling fields...")
+        for field, selector in field_to_selector.items():
+            value = data.get(field, "")
+            if not selector or not value:
+                continue
+            try:
+                page.fill(selector, value, timeout=10000)
+            except Exception as e:
+                # Try click then type as fallback
+                try:
+                    page.click(selector, timeout=5000)
+                    page.keyboard.type(value)
+                except Exception as e2:
+                    if status_cb:
+                        status_cb(f"âš  Warning: Could not fill {field} field: {str(e2)}")
+                    pass
+        if status_cb:
+            status_cb("Done. Leaving browser open for review.")
+        # keep browser open for user; do not close immediately
+
+
+# _run_mvr_automation function moved to MvrRunner_AutomationCore.py
 
 def build_tab(parent):
     """
@@ -423,7 +1012,7 @@ def build_tab(parent):
     _apply_display_size(root, size_key)
 
     # Title
-    title_label = ttk.Label(outer, text="MVR Runner - Copy-Paste Mode", font=("Segoe UI", 12, "bold"))
+    title_label = ttk.Label(outer, text="MVR Runner", font=("Segoe UI", 12, "bold"))
     title_label.pack(pady=(10, 2))
     
     # Directions section - shown/hidden based on saved state
@@ -675,13 +1264,107 @@ def build_tab(parent):
     pdf_listbox.config(yscrollcommand=scrollbar.set)
     
     # Store file paths (list of full paths, indexed by listbox position)
-    pdf_files = []  # List of full file paths
+    pdf_files = []  # List of full file paths or manual entry identifiers (starting with "MANUAL:")
     
     # Store extracted/edited data per file: {filepath: {license_number: "", last_name: "", first_name: "", dob: "", state: ""}}
-    file_data = {}  # Dictionary mapping file paths to their extracted/edited data
+    file_data = {}  # Dictionary mapping file paths (or manual identifiers) to their extracted/edited data
     
     # Store currently selected file path (persists even when listbox loses focus)
     current_selected_file = None
+    
+    # Expose callback function for external tools (like OllamaTool) to add MVR entries
+    def add_mvr_entry_from_external(mvr_data: Dict[str, str], source: str = "AI"):
+        """Add an MVR entry from an external source (e.g., Ollama AI extraction)"""
+        nonlocal file_data, pdf_files, current_selected_file
+        
+        # Normalize the data
+        new_data = {
+            "license_number": mvr_data.get("license_number", "").strip(),
+            "last_name": mvr_data.get("last_name", "").strip(),
+            "first_name": mvr_data.get("first_name", "").strip(),
+            "dob": mvr_data.get("dob", "").strip().replace("_", ""),
+            "state": mvr_data.get("state", "").strip(),
+            "extracted_text": mvr_data.get("extracted_text", "")
+        }
+        
+        # Check if all fields are empty
+        if not any(new_data.get(k, "") for k in ["license_number", "last_name", "first_name", "dob", "state"]):
+            return False, "No MVR data provided"
+        
+        # Check for duplicate
+        duplicate_id = check_duplicate_mvr_data(new_data)
+        if duplicate_id:
+            return False, "Duplicate entry already exists"
+        
+        # Create a unique identifier
+        import time
+        timestamp = int(time.time())
+        license_part = new_data["license_number"][:10] if new_data["license_number"] else "NONE"
+        last_part = new_data["last_name"][:15] if new_data["last_name"] else "NONE"
+        first_part = new_data["first_name"][:10] if new_data["first_name"] else "NONE"
+        
+        # Create display name
+        display_parts = []
+        if new_data["license_number"]:
+            display_parts.append(f"License: {new_data['license_number'][:10]}")
+        if new_data["last_name"]:
+            display_parts.append(f"{new_data['last_name'][:15]}")
+        if new_data["first_name"]:
+            display_parts.append(f"{new_data['first_name'][:10]}")
+        display_name = " - ".join(display_parts) if display_parts else f"{source} Entry"
+        manual_id = f"MANUAL:{license_part}_{last_part}_{first_part}_{timestamp}"
+        
+        # Add to files list and save data
+        pdf_files.append(manual_id)
+        file_data[manual_id] = new_data
+        file_data[manual_id]["_display_name"] = display_name
+        file_data[manual_id]["_source"] = source
+        
+        # Update listbox display
+        update_listbox_display()
+        
+        # Scroll to top and select the newly added entry
+        if pdf_files:
+            idx = len(pdf_files) - 1
+            pdf_listbox.selection_clear(0, tk.END)
+            pdf_listbox.selection_set(idx)
+            # Scroll to top (index 0) so user can see all entries from the beginning
+            pdf_listbox.see(0)
+            current_selected_file = manual_id
+        
+        # Load the data into fields
+        fields["license_number"].delete(0, tk.END)
+        fields["license_number"].insert(0, new_data["license_number"])
+        fields["last_name"].delete(0, tk.END)
+        fields["last_name"].insert(0, new_data["last_name"])
+        fields["first_name"].delete(0, tk.END)
+        fields["first_name"].insert(0, new_data["first_name"])
+        fields["dob"].delete(0, tk.END)
+        fields["dob"].insert(0, new_data["dob"])
+        fields["state"].delete(0, tk.END)
+        fields["state"].insert(0, new_data["state"])
+        if "extracted_text" in new_data and new_data["extracted_text"]:
+            txt.delete("1.0", tk.END)
+            txt.insert("1.0", new_data["extracted_text"])
+        
+        return True, f"MVR entry added from {source}"
+    
+    # Store the callback in a module-level variable for external access
+    # This allows OllamaTool to call it
+    import sys
+    if 'Tabs.MvrRunner' not in sys.modules:
+        sys.modules['Tabs.MvrRunner'] = sys.modules[__name__]
+    sys.modules['Tabs.MvrRunner']._add_mvr_entry_callback = add_mvr_entry_from_external
+    
+    def scroll_listbox_to_top():
+        """Scroll the MVR listbox to the top"""
+        try:
+            if pdf_listbox.size() > 0:
+                pdf_listbox.see(0)
+        except Exception:
+            pass
+    
+    sys.modules['Tabs.MvrRunner']._scroll_listbox_to_top = scroll_listbox_to_top
     
     # Initialize listbox with empty message
     pdf_listbox.insert(tk.END, "(No files - drag & drop or click 'Add Files...')")
@@ -690,9 +1373,32 @@ def build_tab(parent):
         """Update the listbox to show current files"""
         pdf_listbox.delete(0, tk.END)
         if pdf_files:
-        for i, filepath in enumerate(pdf_files):
-            filename = os.path.basename(filepath)
-            pdf_listbox.insert(tk.END, f"{i+1}. {filename}")
+            for i, filepath in enumerate(pdf_files):
+                if filepath.startswith("MANUAL:"):
+                    # Manual entry - get display name from file_data if available
+                    if filepath in file_data:
+                        data = file_data[filepath]
+                        # Use stored display name if available, otherwise generate it
+                        if "_display_name" in data:
+                            display_name = data["_display_name"]
+                        else:
+                            display_parts = []
+                            if data.get("license_number"):
+                                display_parts.append(f"License: {data['license_number'][:10]}")
+                            if data.get("last_name"):
+                                display_parts.append(data["last_name"][:15])
+                            if data.get("first_name"):
+                                display_parts.append(data["first_name"][:10])
+                            # Add position if available
+                            if data.get("position"):
+                                display_parts.append(f"({data['position'][:10]})")
+                            display_name = " - ".join(display_parts) if display_parts else "Manual Entry"
+                    else:
+                        display_name = "Manual Entry"
+                    pdf_listbox.insert(tk.END, f"{i+1}. {display_name}")
+                else:
+                    filename = os.path.basename(filepath)
+                    pdf_listbox.insert(tk.END, f"{i+1}. {filename}")
         else:
             # Always show at least one row, even if empty
             pdf_listbox.insert(tk.END, "(No files - drag & drop or click 'Add Files...')")
@@ -737,6 +1443,33 @@ def build_tab(parent):
                 # Clear fields if this was the selected file
                 clear_fields()
     
+    def normalize_mvr_data(data):
+        """Normalize MVR data for comparison (case-insensitive, trimmed)"""
+        return {
+            "license_number": (data.get("license_number", "") or "").strip().upper(),
+            "last_name": (data.get("last_name", "") or "").strip().upper(),
+            "first_name": (data.get("first_name", "") or "").strip().upper(),
+            "dob": (data.get("dob", "") or "").strip().replace("_", "").replace("/", "").replace("-", ""),
+            "state": (data.get("state", "") or "").strip().upper()
+        }
+    
+    def mvr_data_matches(data1, data2):
+        """Check if two MVR data dictionaries match (all fields identical)"""
+        norm1 = normalize_mvr_data(data1)
+        norm2 = normalize_mvr_data(data2)
+        return (norm1["license_number"] == norm2["license_number"] and
+                norm1["last_name"] == norm2["last_name"] and
+                norm1["first_name"] == norm2["first_name"] and
+                norm1["dob"] == norm2["dob"] and
+                norm1["state"] == norm2["state"])
+    
+    def check_duplicate_mvr_data(new_data):
+        """Check if the given MVR data already exists in file_data"""
+        for existing_id, existing_data in file_data.items():
+            if mvr_data_matches(new_data, existing_data):
+                return existing_id
+        return None
+    
     def clear_all_files():
         """Clear all files from the list"""
         nonlocal current_selected_file
@@ -755,46 +1488,7 @@ def build_tab(parent):
                 var.set("")
         txt.delete("1.0", "end")
     
-    def format_dob_value(value):
-        """Format a DOB value to __/__/____ format"""
-        if not value:
-            return "__/__/____"
-        # Remove all non-digits
-        digits = ''.join(filter(str.isdigit, value))
-        if len(digits) == 0:
-            return "__/__/____"
-        # Limit to 8 digits (MMDDYYYY)
-        digits = digits[:8]
-        
-        # Build formatted string
-        formatted = ""
-        if len(digits) >= 1:
-            formatted = digits[0]
-        if len(digits) >= 2:
-            formatted = digits[0:2]
-        if len(digits) >= 3:
-            formatted = digits[0:2] + "/" + digits[2]
-        if len(digits) >= 4:
-            formatted = digits[0:2] + "/" + digits[2:4]
-        if len(digits) >= 5:
-            formatted = digits[0:2] + "/" + digits[2:4] + "/" + digits[4]
-        if len(digits) >= 6:
-            formatted = digits[0:2] + "/" + digits[2:4] + "/" + digits[4:6]
-        if len(digits) >= 7:
-            formatted = digits[0:2] + "/" + digits[2:4] + "/" + digits[4:7]
-        if len(digits) >= 8:
-            formatted = digits[0:2] + "/" + digits[2:4] + "/" + digits[4:8]
-        
-        # Fill remaining with underscores to maintain format
-        while len(formatted) < 10:
-            if len(formatted) == 2:
-                formatted += "/"
-            elif len(formatted) == 5:
-                formatted += "/"
-            else:
-                formatted += "_"
-        
-        return formatted
+    # format_dob_value is imported from MvrRunner_Shared, no need to redefine
     
     def load_file_data(filepath):
         """Load saved data for a file into the fields"""
@@ -805,12 +1499,52 @@ def build_tab(parent):
                     # Format DOB when loading
                     dob_value = data.get(key, "")
                     var.set(format_dob_value(dob_value))
+                elif key == "state":
+                    # Convert state abbreviation to full name if needed (for backward compatibility)
+                    state_value = data.get(key, "").strip().upper()
+                    if state_value and len(state_value) == 2:
+                        # It's likely an abbreviation - try to convert to full name
+                        abbrev_to_full = {
+                            "AL": "ALABAMA", "AK": "ALASKA", "AZ": "ARIZONA", "AR": "ARKANSAS", "CA": "CALIFORNIA",
+                            "CO": "COLORADO", "CT": "CONNECTICUT", "DE": "DELAWARE", "FL": "FLORIDA", "GA": "GEORGIA",
+                            "HI": "HAWAII", "ID": "IDAHO", "IL": "ILLINOIS", "IN": "INDIANA", "IA": "IOWA",
+                            "KS": "KANSAS", "KY": "KENTUCKY", "LA": "LOUISIANA", "ME": "MAINE", "MD": "MARYLAND",
+                            "MA": "MASSACHUSETTS", "MI": "MICHIGAN", "MN": "MINNESOTA", "MS": "MISSISSIPPI", "MO": "MISSOURI",
+                            "MT": "MONTANA", "NE": "NEBRASKA", "NV": "NEVADA", "NH": "NEW HAMPSHIRE", "NJ": "NEW JERSEY",
+                            "NM": "NEW MEXICO", "NY": "NEW YORK", "NC": "NORTH CAROLINA", "ND": "NORTH DAKOTA", "OH": "OHIO",
+                            "OK": "OKLAHOMA", "OR": "OREGON", "PA": "PENNSYLVANIA", "RI": "RHODE ISLAND", "SC": "SOUTH CAROLINA",
+                            "SD": "SOUTH DAKOTA", "TN": "TENNESSEE", "TX": "TEXAS", "UT": "UTAH", "VT": "VERMONT",
+                            "VA": "VIRGINIA", "WA": "WASHINGTON", "WV": "WEST VIRGINIA", "WI": "WISCONSIN", "WY": "WYOMING",
+                            "DC": "DISTRICT OF COLUMBIA"
+                        }
+                        full_name = abbrev_to_full.get(state_value)
+                        if full_name:
+                            var.set(full_name)
+                        else:
+                            var.set(data.get(key, ""))
+                    else:
+                        var.set(data.get(key, ""))
                 else:
                     var.set(data.get(key, ""))
             # Also load extracted text if available
             if "extracted_text" in data:
                 txt.delete("1.0", "end")
                 txt.insert("1.0", data["extracted_text"])
+            
+            # Show position and status in extracted text if available (from dealer app)
+            if data.get("position") or data.get("status"):
+                info_lines = []
+                if data.get("position"):
+                    info_lines.append(f"Position: {data['position']}")
+                if data.get("status"):
+                    info_lines.append(f"Status: {data['status']}")
+                if info_lines:
+                    # Append to extracted text if it exists, otherwise set it
+                    current_text = txt.get("1.0", "end-1c").strip()
+                    if current_text:
+                        txt.insert("end", "\n\n" + "\n".join(info_lines))
+                    else:
+                        txt.insert("1.0", "\n".join(info_lines))
         else:
             clear_fields()
     
@@ -819,6 +1553,11 @@ def build_tab(parent):
         if filepath:
             # Clean DOB - remove underscores, keep digits and slashes
             dob_value = fields["dob"].get().strip().replace("_", "")
+            # Preserve display name for manual entries
+            old_display_name = None
+            if filepath.startswith("MANUAL:") and filepath in file_data:
+                old_display_name = file_data[filepath].get("_display_name")
+            
             file_data[filepath] = {
                 "license_number": fields["license_number"].get().strip(),
                 "last_name": fields["last_name"].get().strip(),
@@ -827,6 +1566,24 @@ def build_tab(parent):
                 "state": fields["state"].get().strip(),
                 "extracted_text": txt.get("1.0", "end-1c")
             }
+            
+            # Restore or update display name for manual entries
+            if filepath.startswith("MANUAL:"):
+                if old_display_name:
+                    file_data[filepath]["_display_name"] = old_display_name
+                else:
+                    # Generate new display name if not present
+                    data = file_data[filepath]
+                    display_parts = []
+                    if data.get("license_number"):
+                        display_parts.append(f"License: {data['license_number'][:10]}")
+                    if data.get("last_name"):
+                        display_parts.append(data["last_name"][:15])
+                    if data.get("first_name"):
+                        display_parts.append(data["first_name"][:10])
+                    file_data[filepath]["_display_name"] = " - ".join(display_parts) if display_parts else "Manual Entry"
+                # Update listbox display to reflect changes
+                update_listbox_display()
     
     # File management buttons (always visible, not shrinkable) - directly below the list frame
     file_btn_frame = ttk.Frame(file_section_frame)
@@ -867,250 +1624,15 @@ def build_tab(parent):
         "password": tk.StringVar(value=saved_settings.get("login_selectors", {}).get("password", "")),
     }
     
-    def show_site_automation_dialog():
-        """Open full-screen dialog for site automation settings"""
-        root = outer.winfo_toplevel()
-        dialog = tk.Toplevel(root)
-        dialog.title("Site Automation Settings")
-        # Make it large and centered
-        dialog.geometry("900x700")
-        dialog.transient(root)
-        dialog.grab_set()  # Make it modal
-        
-        # Center the dialog
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (900 // 2)
-        y = (dialog.winfo_screenheight() // 2) - (700 // 2)
-        dialog.geometry(f"900x700+{x}+{y}")
-        
-        # Main container
-        main_frame = ttk.Frame(dialog, padding=20)
-        main_frame.pack(fill="both", expand=True)
-        
-        ttk.Label(main_frame, text="Site Automation Settings", font=("Segoe UI", 14, "bold")).pack(pady=(0, 20))
-        
-        # URL setting
-        url_frame = ttk.LabelFrame(main_frame, text="Target URL", padding=10)
-        url_frame.pack(fill="x", pady=(0, 15))
-        ttk.Label(url_frame, text="URL:").pack(anchor="w")
-        url_entry = ttk.Entry(url_frame, textvariable=url_var, width=60)
-        url_entry.pack(fill="x", pady=(5, 0))
-        
-        # CSS Selectors
-        selectors_frame = ttk.LabelFrame(main_frame, text="CSS Selectors", padding=10)
-        selectors_frame.pack(fill="both", expand=True, pady=(0, 15))
-        
-        selector_grid = ttk.Frame(selectors_frame)
-        selector_grid.pack(fill="both", expand=True)
-        
-        ttk.Label(selector_grid, text="Field", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        ttk.Label(selector_grid, text="CSS Selector", font=("Segoe UI", 10, "bold")).grid(row=0, column=1, sticky="w", padx=5, pady=5)
-        
-        for i, (label, key) in enumerate([
-            ("License #", "license_number"), 
-            ("Last Name", "last_name"), 
-            ("First Name", "first_name"), 
-            ("DOB", "dob"), 
-            ("State", "state"),
-            ("Order Type", "order_type"),
-            ("Product", "product"),
-            ("Purpose", "purpose")
-        ], start=1):
-            ttk.Label(selector_grid, text=label).grid(row=i, column=0, sticky="e", padx=5, pady=5)
-            entry = ttk.Entry(selector_grid, textvariable=sel_vars[key], width=50)
-            entry.grid(row=i, column=1, sticky="we", padx=5, pady=5)
-        
-        selector_grid.columnconfigure(1, weight=1)
-        
-        # Buttons
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill="x")
-        def on_save_site_settings():
-            # Save site automation settings
-            settings = _load_mvr_settings()
-            settings["url"] = url_var.get().strip()
-            settings["selectors"] = {
-                "license_number": sel_vars["license_number"].get().strip(),
-                "last_name": sel_vars["last_name"].get().strip(),
-                "first_name": sel_vars["first_name"].get().strip(),
-                "dob": sel_vars["dob"].get().strip(),
-                "state": sel_vars["state"].get().strip(),
-                "order_type": sel_vars["order_type"].get().strip(),
-                "product": sel_vars["product"].get().strip(),
-                "purpose": sel_vars["purpose"].get().strip(),
-            }
-            settings["use_existing_chrome"] = use_existing_var.get()
-            settings["debug_port"] = debug_port_var.get().strip()
-            _save_mvr_settings(settings)
-            dialog.destroy()
-        ttk.Button(btn_frame, text="Save", command=on_save_site_settings, width=15).pack(side="right", padx=(5, 0))
-        ttk.Button(btn_frame, text="Cancel", command=lambda: dialog.destroy(), width=15).pack(side="right")
-    
-    def show_login_settings_dialog():
-        """Open dialog for login settings"""
-        root = outer.winfo_toplevel()
-        dialog = tk.Toplevel(root)
-        dialog.title("Login Settings")
-        dialog.geometry("700x650")  # Increased size to ensure buttons are visible
-        dialog.transient(root)
-        dialog.grab_set()  # Make it modal
-        
-        # Center the dialog
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (700 // 2)
-        y = (dialog.winfo_screenheight() // 2) - (650 // 2)
-        dialog.geometry(f"700x650+{x}+{y}")
-        
-        # Create a container with scrollable content area and fixed button area
-        outer_container = ttk.Frame(dialog)
-        outer_container.pack(fill="both", expand=True, padx=0, pady=0)
-        
-        # Scrollable content area
-        canvas = tk.Canvas(outer_container)
-        scrollbar = ttk.Scrollbar(outer_container, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-        
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        
-        # Main content frame inside scrollable area
-        main_frame = ttk.Frame(scrollable_frame, padding=20)
-        main_frame.pack(fill="both", expand=True)
-        
-        ttk.Label(main_frame, text="Login Settings", font=("Segoe UI", 14, "bold")).pack(pady=(0, 20))
-        
-        # Login credentials
-        login_frame = ttk.LabelFrame(main_frame, text="Login Credentials", padding=15)
-        login_frame.pack(fill="x", pady=(0, 15))
-        
-        # Account ID
-        ttk.Label(login_frame, text="Account ID:").grid(row=0, column=0, sticky="w", padx=5, pady=5)
-        account_entry = ttk.Entry(login_frame, textvariable=account_id_var, width=40)
-        account_entry.grid(row=0, column=1, sticky="we", padx=5, pady=5)
-        # Ensure the entry field updates the variable
-        account_entry.bind('<KeyRelease>', lambda e: account_id_var.set(account_entry.get()))
-        
-        # User ID/User Name
-        ttk.Label(login_frame, text="User ID/User Name:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        user_entry = ttk.Entry(login_frame, textvariable=user_id_var, width=40)
-        user_entry.grid(row=1, column=1, sticky="we", padx=5, pady=5)
-        
-        # Password
-        ttk.Label(login_frame, text="Password:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
-        password_entry = ttk.Entry(login_frame, textvariable=password_var, width=40, show="*")
-        password_entry.grid(row=2, column=1, sticky="we", padx=5, pady=5)
-        
-        # Auto-click reCAPTCHA checkbox
-        recaptcha_checkbox = ttk.Checkbutton(login_frame, text="Automatically click 'I'm not a robot' checkbox", 
-                                             variable=auto_click_recaptcha_var)
-        recaptcha_checkbox.grid(row=3, column=0, columnspan=2, sticky="w", padx=5, pady=10)
-        
-        login_frame.columnconfigure(1, weight=1)
-        
-        # Save button right under Password field
-        def on_save_login_settings():
-            # Save login settings
-            try:
-                settings = _load_mvr_settings()
-                
-                # Get values from entry fields
-                account_id_value = account_id_var.get().strip()
-                user_id_value = user_id_var.get().strip()
-                password_value = password_var.get().strip()
-                
-                # Update settings
-                settings["account_id"] = account_id_value
-                settings["user_id"] = user_id_value
-                settings["password"] = password_value
-                settings["auto_click_recaptcha"] = auto_click_recaptcha_var.get()
-                settings["login_selectors"] = {
-                    "account_id": login_sel_vars["account_id"].get().strip(),
-                    "user_id": login_sel_vars["user_id"].get().strip(),
-                    "password": login_sel_vars["password"].get().strip(),
-                }
-                
-                # Save to file
-                save_success = _save_mvr_settings(settings)
-                
-                if save_success:
-                    # Verify account_id was actually saved
-                    verify_settings = _load_mvr_settings()
-                    if verify_settings.get("account_id") == account_id_value:
-                        # Show confirmation
-                        import tkinter.messagebox as mb
-                        mb.showinfo("Settings Saved", "Login settings have been saved successfully.")
-                    else:
-                        import tkinter.messagebox as mb
-                        mb.showwarning("Save Warning", "Settings may not have saved correctly. Please try again.")
-                else:
-                    import tkinter.messagebox as mb
-                    mb.showerror("Save Error", "Failed to save settings. Please check file permissions.")
-                
-                dialog.destroy()
-            except Exception as e:
-                import tkinter.messagebox as mb
-                mb.showerror("Save Error", f"Failed to save settings: {str(e)}")
-        
-        # Save button frame - placed right after reCAPTCHA checkbox
-        save_btn_frame = ttk.Frame(login_frame)
-        save_btn_frame.grid(row=4, column=0, columnspan=2, pady=(15, 5), sticky="e")
-        
-        save_btn = ttk.Button(save_btn_frame, text="Save", command=on_save_login_settings, width=15)
-        save_btn.pack(side="right", padx=(5, 0))
-        
-        cancel_btn = ttk.Button(save_btn_frame, text="Cancel", command=lambda: dialog.destroy(), width=15)
-        cancel_btn.pack(side="right")
-        
-        # CSS Selectors for login fields
-        selectors_frame = ttk.LabelFrame(main_frame, text="CSS Selectors for Login Fields (Optional)", padding=15)
-        selectors_frame.pack(fill="x", pady=(0, 15))
-        
-        # Use a separate frame for the info label to avoid grid/pack conflict
-        info_frame = ttk.Frame(selectors_frame)
-        info_frame.grid(row=0, column=0, columnspan=2, sticky="w", padx=5, pady=(0, 10))
-        ttk.Label(info_frame, text="If your login form uses non-standard field names, specify CSS selectors here.\nLeave empty to use automatic detection.", 
-                 font=("Segoe UI", 9), foreground="gray").pack(anchor="w")
-        
-        # Account ID Selector
-        ttk.Label(selectors_frame, text="Account ID Selector:").grid(row=1, column=0, sticky="w", padx=5, pady=5)
-        account_sel_entry = ttk.Entry(selectors_frame, textvariable=login_sel_vars["account_id"], width=45)
-        account_sel_entry.grid(row=1, column=1, sticky="we", padx=5, pady=5)
-        
-        # User ID Selector
-        ttk.Label(selectors_frame, text="User ID Selector:").grid(row=2, column=0, sticky="w", padx=5, pady=5)
-        user_sel_entry = ttk.Entry(selectors_frame, textvariable=login_sel_vars["user_id"], width=45)
-        user_sel_entry.grid(row=2, column=1, sticky="we", padx=5, pady=5)
-        
-        # Password Selector
-        ttk.Label(selectors_frame, text="Password Selector:").grid(row=3, column=0, sticky="w", padx=5, pady=5)
-        password_sel_entry = ttk.Entry(selectors_frame, textvariable=login_sel_vars["password"], width=45)
-        password_sel_entry.grid(row=3, column=1, sticky="we", padx=5, pady=5)
-        
-        selectors_frame.columnconfigure(1, weight=1)
-        
-        # Update scroll region
-        canvas.update_idletasks()
-        canvas.configure(scrollregion=canvas.bbox("all"))
-        
-        # Ensure dialog is properly sized
-        dialog.update_idletasks()
-        dialog.minsize(700, 500)
-    
     # Button widths scale with display size - use relative widths instead of fixed
     # Store button references for dynamic resizing
     add_files_btn = ttk.Button(file_mgmt_row, text="Add Files...", command=choose_pdf)
     remove_btn = ttk.Button(file_mgmt_row, text="Remove", command=remove_selected_file)
     clear_all_btn = ttk.Button(file_mgmt_row, text="Clear All", command=clear_all_files)
-    login_settings_btn = ttk.Button(file_mgmt_row, text="Login Settings", command=show_login_settings_dialog)
-    site_automation_btn = ttk.Button(file_mgmt_row, text="Site Automation Settings", command=show_site_automation_dialog)
+    login_settings_btn = ttk.Button(file_mgmt_row, text="Login Settings", 
+                                    command=lambda: show_login_settings_dialog(outer, account_id_var, user_id_var, password_var, auto_click_recaptcha_var, login_sel_vars))
+    site_automation_btn = ttk.Button(file_mgmt_row, text="Site Automation Settings", 
+                                     command=lambda: show_site_automation_dialog(outer, url_var, sel_vars, use_existing_var, debug_port_var))
     
     # Pack buttons with appropriate spacing and vertical padding to ensure text is visible
     add_files_btn.pack(side="left", padx=(0, 4), pady=2)
@@ -1148,55 +1670,17 @@ def build_tab(parent):
             base_padding = 4.0  # Medium baseline padding
             padding_scale = button_padding / base_padding if base_padding > 0 else 1.0
             
-            # More aggressive scaling: font size has a bigger impact on character width
-            # Use a weighted approach: 80% font scale, 20% padding scale (increased font weight)
-            combined_scale = (font_scale * 0.8) + (padding_scale * 0.2)
+            # Combined scale factor
+            combined_scale = font_scale * (1.0 + (padding_scale - 1.0) * 0.3)  # Padding has less impact than font
             
-            # Update each button with properly scaled width
+            # Apply scaled widths to each button
             for btn, text, base_width in button_configs:
-                # Calculate new width: base width scaled by font and padding
-                scaled_width = base_width * combined_scale
-                
-                # For larger fonts, add extra width to prevent text compression
-                if font_size > base_font_size:
-                    # More aggressive: 20% extra width per point above baseline (increased from 15%)
-                    extra_scale = 1.0 + ((font_size - base_font_size) * 0.20)
-                    scaled_width *= extra_scale
-                
-                # For smaller fonts, ensure we still have enough width
-                elif font_size < base_font_size:
-                    # Don't shrink too much - maintain readability
-                    scaled_width = max(scaled_width, base_width * 0.95)  # Increased from 0.9
-                
-                # Ensure minimum width based on text length with very generous padding
-                text_length = len(text)
-                # Very generous padding: text length + 6 chars for better spacing (increased from 4)
-                # Also scale minimum width by font size to account for wider characters
-                min_width_text = (text_length + 6) * font_scale
-                min_width = max(int(min_width_text), int(base_width * 0.9))
-                
-                # Final width is the maximum of scaled width and minimum width
-                new_width = max(int(scaled_width), min_width)
-                
-                # Configure button with new width
-                btn.configure(width=new_width)
-                
-                # Force immediate update to prevent warping
-                btn.update_idletasks()
-                # Also force a full update to ensure layout is recalculated
-                btn.update()
-        except Exception as e:
-            # If there's an error, try to set reasonable defaults
-            try:
-                for btn, text, base_width in button_configs:
-                    # Fallback: use text length + generous padding
-                    min_width = len(text) + 6
-                    btn.configure(width=max(base_width, min_width))
-            except Exception:
-                pass
-    
-    # Store button update function for later use
-    button_width_updater = update_button_widths
+                scaled_width = int(base_width * combined_scale)
+                # Ensure minimum width
+                scaled_width = max(scaled_width, len(text) + 2)
+                btn.configure(width=scaled_width)
+        except Exception:
+            pass  # If update fails, buttons will use default widths
     
     # Initial button width setup
     update_button_widths()
@@ -1213,6 +1697,7 @@ def build_tab(parent):
             # Set minimum height on the button row frame to match actual button height + padding
             button_frame_min = actual_button_height + 10  # Add padding for frame (top + bottom)
             # Update the grid row minimum if needed to ensure buttons are fully visible
+            button_row_min_height = 0  # Default minimum
             if button_frame_min > button_row_min_height:
                 # Update the minimum size for the button row - CRITICAL for button visibility
                 file_list_frame.grid_rowconfigure(1, minsize=button_frame_min)
@@ -1297,9 +1782,7 @@ def build_tab(parent):
             
             # Also update Run button width if it exists
             try:
-                # Try to call update_run_button_width if it exists in the scope
-                # This will be set up after the button is created
-                pass  # Will be handled by the enhanced_updater if set up
+                update_run_button_width()
             except Exception:
                 pass
             
@@ -1354,6 +1837,7 @@ def build_tab(parent):
             pass
     
     # Store the enhanced updater for use by display size changer
+    button_layout_updater_ref = [None]
     button_layout_updater_ref[0] = update_button_layout
 
     # Middle: extracted text and parsed fields (part of main paned window)
@@ -1625,11 +2109,84 @@ def build_tab(parent):
         else:
             row(fields_frame, label, fields[key], key)
     
-        # Status function for compatibility
+    # Save as MVR button (for manually entered data)
+    save_mvr_btn_frame = ttk.Frame(fields_container)
+    save_mvr_btn_frame.grid(row=2, column=0, sticky="ew", padx=0, pady=(10, 0))
+    fields_container.grid_rowconfigure(2, weight=0)  # Button row doesn't expand
+    
+    def on_save_as_mvr():
+        """Save manually entered fields as a new MVR entry"""
+        # Get current field values
+        dob_value = fields["dob"].get().strip().replace("_", "")
+        new_data = {
+            "license_number": fields["license_number"].get().strip(),
+            "last_name": fields["last_name"].get().strip(),
+            "first_name": fields["first_name"].get().strip(),
+            "dob": dob_value,
+            "state": fields["state"].get().strip(),
+            "extracted_text": txt.get("1.0", "end-1c")
+        }
+        
+        # Check if all fields are empty
+        if not any(new_data.get(k, "") for k in ["license_number", "last_name", "first_name", "dob", "state"]):
+            messagebox.showwarning("Empty Fields", "Please enter at least one field before saving.")
+            return
+        
+        # Check for duplicate
+        duplicate_id = check_duplicate_mvr_data(new_data)
+        if duplicate_id:
+            messagebox.showwarning("Duplicate Entry", "This MVR file already exists.")
+            set_status("Duplicate entry - not saved")
+            return
+        
+        # Create a unique identifier for this manual entry
+        # Use license + last name + first name for display, with timestamp for uniqueness
+        import time
+        timestamp = int(time.time())
+        license_part = new_data["license_number"][:10] if new_data["license_number"] else "NONE"
+        last_part = new_data["last_name"][:15] if new_data["last_name"] else "NONE"
+        first_part = new_data["first_name"][:10] if new_data["first_name"] else "NONE"
+        # Create a readable display name
+        display_parts = []
+        if new_data["license_number"]:
+            display_parts.append(f"License: {new_data['license_number'][:10]}")
+        if new_data["last_name"]:
+            display_parts.append(f"{new_data['last_name'][:15]}")
+        if new_data["first_name"]:
+            display_parts.append(f"{new_data['first_name'][:10]}")
+        display_name = " - ".join(display_parts) if display_parts else "Manual Entry"
+        manual_id = f"MANUAL:{license_part}_{last_part}_{first_part}_{timestamp}"
+        
+        # Add to files list and save data
+        pdf_files.append(manual_id)
+        file_data[manual_id] = new_data
+        
+        # Store display name in file_data for easy retrieval
+        file_data[manual_id]["_display_name"] = display_name
+        
+        # Update listbox display
+        update_listbox_display()
+        
+        # Select the newly added entry
+        if pdf_files:
+            idx = len(pdf_files) - 1
+            pdf_listbox.selection_clear(0, tk.END)
+            pdf_listbox.selection_set(idx)
+            pdf_listbox.see(idx)
+            nonlocal current_selected_file
+            current_selected_file = manual_id
+        
+        set_status("MVR entry saved successfully")
+        messagebox.showinfo("Saved", "MVR entry has been saved and added to the list.")
+    
+    save_mvr_btn = ttk.Button(save_mvr_btn_frame, text="Save as MVR", command=on_save_as_mvr, width=15)
+    save_mvr_btn.pack(side="left", padx=(0, 5))
+    
+    # Status function placeholder (will be redefined later with status label)
     def set_status(msg: str):
-        # Status messages not displayed in Copy-Paste mode
+        """Placeholder - will be updated when status label is created"""
         pass
-
+    
     def get_selected_file():
         """Get the currently selected file from the listbox or stored selection"""
         nonlocal current_selected_file
@@ -1646,8 +2203,15 @@ def build_tab(parent):
     
     def on_extract():
         p = get_selected_file()
-        if not p or not os.path.isfile(p):
+        if not p:
             messagebox.showwarning("No File Selected", "Please select a file from the list above.")
+            return
+        # Skip extraction for manual entries (they already have data)
+        if p.startswith("MANUAL:"):
+            messagebox.showinfo("Manual Entry", "This is a manually entered MVR entry. Data is already loaded.")
+            return
+        if not os.path.isfile(p):
+            messagebox.showwarning("File Not Found", "The selected file no longer exists.")
             return
         def work():
             try:
@@ -1675,8 +2239,18 @@ def build_tab(parent):
     def on_save():
         """Save current field values for the selected file"""
         p = get_selected_file()
-        if not p or not os.path.isfile(p):
+        if not p:
             messagebox.showwarning("No File Selected", "Please select a file from the list above.")
+            return
+        # For manual entries, just update the data
+        if p.startswith("MANUAL:"):
+            save_file_data(p)
+            set_status("Data saved for this MVR entry")
+            messagebox.showinfo("Saved", "Data has been saved for this MVR entry.")
+            return
+        # For PDF files, check if file exists
+        if not os.path.isfile(p):
+            messagebox.showwarning("File Not Found", "The selected file no longer exists.")
             return
         
         save_file_data(p)
@@ -1688,16 +2262,17 @@ def build_tab(parent):
     save_row.pack(fill="x")
     ttk.Button(save_row, text="Save", command=on_save, width=12).pack(side="left")
     
-    # Drag and drop handler - supports multiple files
+    # Drag and drop handler - supports multiple files (cross-platform: Windows & Linux)
     def on_drop(e):
         data = (e.data or "").strip()
         if not data:
             return
         
         file_paths = []
+        is_windows = os.name == 'nt'
         
         # Strategy 1: Handle curly braces format - each file wrapped in {}
-        # Pattern: {C:/path/to/file.pdf} or {C:\path\to\file.pdf}
+        # Pattern: {/path/to/file.pdf} or {C:\path\to\file.pdf}
         # Split by } { to separate multiple files
         if "{" in data and "}" in data:
             # Split by } followed by optional whitespace and {
@@ -1705,14 +2280,15 @@ def build_tab(parent):
             for part in parts:
                 # Remove leading { and trailing }
                 path = part.strip().strip('{').strip('}').strip()
-                # Normalize forward slashes to backslashes for Windows
-                path = path.replace('/', '\\')
+                # Only normalize slashes on Windows
+                if is_windows:
+                    path = path.replace('/', '\\')
                 if path and os.path.isfile(path) and path.lower().endswith(".pdf"):
                     if path not in file_paths:
                         file_paths.append(path)
         
-        # Strategy 2: If no curly braces, try quoted paths
-        if not file_paths:
+        # Strategy 2: If no curly braces, try quoted paths (Windows style)
+        if not file_paths and is_windows:
             # Pattern 1: Quoted paths: "C:\path with spaces\file.pdf" or "C:/path/file.pdf"
             quoted_pattern = r'"([A-Za-z]:[^"]+\.pdf)"'
             quoted_matches = re.finditer(quoted_pattern, data, re.IGNORECASE)
@@ -1722,19 +2298,36 @@ def build_tab(parent):
                     if path not in file_paths:
                         file_paths.append(path)
         
-        # Strategy 3: Unquoted paths (no spaces): C:\path\to\file.pdf or C:/path/file.pdf
-        if not file_paths:
-            unquoted_pattern = r'(?:^|\s)([A-Za-z]:[^\s"]+\.pdf)(?=\s|$)'
-            unquoted_matches = re.finditer(unquoted_pattern, data, re.IGNORECASE)
-            for match in unquoted_matches:
-                path = match.group(1).strip().replace('/', '\\')
+        # Strategy 2b: Quoted Unix paths: "/path/to/file.pdf"
+        if not file_paths and not is_windows:
+            quoted_unix_pattern = r'"(/[^"]+\.pdf)"'
+            quoted_matches = re.finditer(quoted_unix_pattern, data, re.IGNORECASE)
+            for match in quoted_matches:
+                path = match.group(1)
                 if os.path.isfile(path) and path.lower().endswith(".pdf"):
                     if path not in file_paths:
                         file_paths.append(path)
         
-        # Strategy 4: Try as single file (fallback)
+        # Strategy 3: Unquoted paths (no spaces): C:\path\to\file.pdf or /path/to/file.pdf
         if not file_paths:
-            test_path = data.strip().strip('"').strip('{').strip('}').replace('/', '\\')
+            if is_windows:
+                unquoted_pattern = r'(?:^|\s)([A-Za-z]:[^\s"]+\.pdf)(?=\s|$)'
+            else:
+                unquoted_pattern = r'(?:^|\s)(/[^\s"]+\.pdf)(?=\s|$)'
+            unquoted_matches = re.finditer(unquoted_pattern, data, re.IGNORECASE)
+            for match in unquoted_matches:
+                path = match.group(1).strip()
+                if is_windows:
+                    path = path.replace('/', '\\')
+                if os.path.isfile(path) and path.lower().endswith(".pdf"):
+                    if path not in file_paths:
+                        file_paths.append(path)
+        
+        # Strategy 4: Try as single file (fallback - works for any OS)
+        if not file_paths:
+            test_path = data.strip().strip('"').strip('{').strip('}')
+            if is_windows:
+                test_path = test_path.replace('/', '\\')
             if os.path.isfile(test_path) and test_path.lower().endswith(".pdf"):
                 file_paths.append(test_path)
         
@@ -1777,42 +2370,178 @@ def build_tab(parent):
             except Exception:
                 pass
 
-    def on_fill():
-        url = url_var.get().strip()
-        if not url:
-            messagebox.showwarning("Missing URL", "Enter a target URL.")
+    def run_mvrs():
+        """Run MVR automation for all files - auto-extracts if needed"""
+        if not pdf_files:
+            messagebox.showwarning("No Files", "Please add MVR files first.")
             return
-        # Build data dict from fields
-        data = {k: v.get().strip() for k, v in fields.items()}
-        selectors = {k: v.get().strip() for k, v in sel_vars.items()}
+        
+        # Get login credentials
+        account_id = account_id_var.get().strip()
+        user_id = user_id_var.get().strip()
+        password = password_var.get().strip()
+        
+        if not account_id or not user_id or not password:
+            messagebox.showwarning("Missing Login", "Please configure Login Settings first.")
+            return
+        
+        url = url_var.get().strip()
+        if not url or url == "https://example.com/":
+            messagebox.showwarning("Missing URL", "Please configure Site Automation Settings first.")
+            return
+        
         def work():
             try:
-                set_status("Checking Playwright...")
+                set_status("Extracting data from all MVR files...")
                 _ensure_playwright_browsers_installed(set_status)
-                cdp_endpoint = None
-                if use_existing_var.get():
-                    port_str = (debug_port_var.get() or "").strip()
-                    try:
-                        port = int(port_str)
-                    except Exception:
-                        port = 9222
-                    # Note: existing Chrome must be started with --remote-debugging-port=PORT
-                    if _is_chrome_running():
-                        if _is_port_open("127.0.0.1", port):
-                            cdp_endpoint = f"http://127.0.0.1:{port}"
-                            set_status(f"Trying to attach to Chrome on {cdp_endpoint}...")
-                        else:
-                            set_status(f"Chrome running, but port {port} not open. Will launch new instance.")
+                
+                # Auto-extract data for all files that don't have data yet
+                files_to_process = []
+                for filepath in pdf_files:
+                    # Skip extraction for manual entries (they already have data)
+                    if filepath.startswith("MANUAL:"):
+                        # Manual entry - check if it has data
+                        if filepath in file_data:
+                            data = file_data[filepath]
+                            if any(data.get(k, "") for k in ["license_number", "last_name", "first_name", "dob", "state"]):
+                                files_to_process.append(filepath)
+                        continue
+                    
+                    if filepath not in file_data:
+                        # Extract data for this file
+                        try:
+                            set_status(f"Extracting: {os.path.basename(filepath)}...")
+                            text = _extract_text_from_pdf(filepath)
+                            parsed = _parse_mvr_fields(text)
+                            # Format DOB
+                            if "dob" in parsed:
+                                parsed["dob"] = format_dob_value(parsed["dob"])
+                            # Save to file_data
+                            file_data[filepath] = {
+                                "license_number": parsed.get("license_number", ""),
+                                "last_name": parsed.get("last_name", ""),
+                                "first_name": parsed.get("first_name", ""),
+                                "dob": parsed.get("dob", "").replace("_", ""),  # Clean DOB
+                                "state": parsed.get("state", ""),
+                                "extracted_text": text
+                            }
+                        except Exception as e:
+                            set_status(f"Error extracting {os.path.basename(filepath)}: {str(e)}")
+                            continue
+                    
+                    # Add to processing list if we have valid data
+                    if filepath in file_data:
+                        data = file_data[filepath]
+                        # Check if we have at least some data
+                        if any(data.get(k, "") for k in ["license_number", "last_name", "first_name", "dob", "state"]):
+                            files_to_process.append(filepath)
+                
+                if not files_to_process:
+                    messagebox.showwarning("No Data", "Could not extract data from any files.")
+                    set_status("No data extracted")
+                    return
+                
+                set_status(f"Processing {len(files_to_process)} file(s)...")
+                
+                selectors = {k: v.get().strip() for k, v in sel_vars.items()}
+                login_selectors_dict = {
+                    "account_id": login_sel_vars["account_id"].get().strip(),
+                    "user_id": login_sel_vars["user_id"].get().strip(),
+                    "password": login_sel_vars["password"].get().strip(),
+                }
+                
+                # Process all files sequentially
+                for idx, filepath in enumerate(files_to_process, 1):
+                    # Get display name for manual entries vs PDF files
+                    if filepath.startswith("MANUAL:"):
+                        display_name = filepath.replace("MANUAL:", "Manual Entry")
                     else:
-                        set_status("No Chrome detected. Will launch a new instance.")
-                else:
-                    set_status("Launching new Chromium instance...")
-                _fill_site_with_playwright(url, selectors, data, set_status, cdp_endpoint=cdp_endpoint)
-                set_status("Automation complete")
+                        display_name = os.path.basename(filepath)
+                    set_status(f"Processing file {idx}/{len(files_to_process)}: {display_name}...")
+                    data = file_data[filepath]
+                    # Run automation with login (only login once on first file)
+                    try:
+                        _run_mvr_automation(
+                            url, selectors, data, account_id, user_id, password, 
+                            set_status, cdp_endpoint=None, 
+                            skip_login=(idx > 1),  # Skip login after first file
+                            login_selectors=login_selectors_dict if any(login_selectors_dict.values()) else None,
+                            auto_click_recaptcha=auto_click_recaptcha_var.get()
+                        )
+                    except Exception as automation_error:
+                        error_msg = str(automation_error)
+                        set_status(f"Automation error: {error_msg}")
+                        # For errors, continue or show error
+                        if "timeout" not in error_msg.lower() and "closed" not in error_msg.lower():
+                            messagebox.showerror("Automation Error", error_msg)
+                        raise  # Re-raise to be caught by outer exception handler
+                    # Small delay between files
+                    if idx < len(files_to_process):
+                        import time
+                        time.sleep(1)
+                
+                set_status(f"Completed processing {len(files_to_process)} file(s)")
+                messagebox.showinfo("Complete", f"Successfully processed {len(files_to_process)} file(s).")
             except Exception as e:
                 set_status("Error during automation")
                 messagebox.showerror("Automation Error", str(e))
         threading.Thread(target=work, daemon=True).start()
+    
+    # Bottom section: Status label and Run button
+    bottom_frame = ttk.Frame(right)
+    bottom_frame.grid(row=2, column=0, sticky="ew", padx=0, pady=(10, 0))
+    right.grid_rowconfigure(2, weight=0, minsize=80)  # Minimum height for status + button
+    
+    # Status label for displaying progress messages
+    status_label = ttk.Label(bottom_frame, text="Ready", foreground="gray", font=("Segoe UI", 9))
+    status_label.pack(fill="x", padx=5, pady=(0, 5))
+    
+    # Update set_status to use the status label
+    def set_status(msg: str):
+        """Update the status label with the given message"""
+        try:
+            # Update from main thread (thread-safe)
+            outer.after(0, lambda m=msg: status_label.config(text=m))
+        except Exception:
+            pass
+    
+    # Run/Fill button frame
+    run_btn_frame = ttk.Frame(bottom_frame)
+    run_btn_frame.pack(fill="x")
+    run_btn_frame.grid_columnconfigure(0, weight=1)
+    
+    # Function to update Run button width based on display size
+    def update_run_button_width():
+        """Update Run button width based on current display size"""
+        try:
+            current_size = ui_settings.get("display_size", "Medium")
+            preset = _SIZE_PRESETS.get(current_size, _SIZE_PRESETS["Medium"])
+            font_size = preset["font_size"]
+            button_padding = preset["button_padding"]
+            
+            base_font_size = 10.0
+            font_scale = font_size / base_font_size
+            base_padding = 4.0
+            padding_scale = button_padding / base_padding if base_padding > 0 else 1.0
+            combined_scale = font_scale * (1.0 + (padding_scale - 1.0) * 0.3)
+            
+            text_length = len("Run Mvr's")
+            scaled_width = int(text_length * combined_scale * 1.5)  # Extra space for padding
+            scaled_width = max(scaled_width, text_length + 4)
+            run_btn.configure(width=scaled_width)
+        except Exception:
+            pass
+    
+    # Create Run Mvr's button (now run_mvrs is defined)
+    run_btn = ttk.Button(run_btn_frame, text="Run Mvr's", command=run_mvrs, width=20)
+    run_btn.pack()
+    
+    # Initial button width setup
+    update_run_button_width()
+    
+    # Ensure button frame maintains size
+    run_btn_frame.update_idletasks()
+    run_btn_frame.pack_propagate(False)  # Prevent shrinking
 
     # Selection handler - auto-load saved data or auto-extract when file is selected
     def on_listbox_select(e):
@@ -1821,12 +2550,22 @@ def build_tab(parent):
         if not p:
             return
         
+        # Manual entries always have data, just load it
+        if p.startswith("MANUAL:"):
+            if p in file_data:
+                load_file_data(p)
+                set_status("Loaded manual MVR entry")
+            return
+        
         if p in file_data:
             # File has saved data, load it
             load_file_data(p)
             set_status("Loaded saved data for selected file")
         else:
-            # No saved data, auto-extract
+            # No saved data, auto-extract (only for PDF files)
+            if not os.path.isfile(p):
+                set_status("File not found")
+                return
             def work():
                 try:
                     set_status("Auto-extracting...")
@@ -1853,8 +2592,4 @@ def build_tab(parent):
     pdf_listbox.bind("<<ListboxSelect>>", on_listbox_select)
     
     return outer
-
-
-
-
-
+    

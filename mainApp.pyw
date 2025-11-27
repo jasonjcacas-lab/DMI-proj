@@ -42,8 +42,8 @@ def _import_splitter():
         pass
 
     # 3) Direct file load (case-insensitive filename check) in likely locations
-    search_dirs = [APP_DIR, os.path.join(APP_DIR, "Tabs")]
-    candidate_names = ["Splitter.py", "splitter.py"]
+    search_dirs = [APP_DIR, os.path.join(APP_DIR, "Tabs"), os.path.join(APP_DIR, "Tabs", "Splitter")]
+    candidate_names = ["Splitter.py", "splitter.py", "main.py"]
 
     tried_paths = []
     for d in search_dirs:
@@ -148,11 +148,11 @@ def main():
         mvr_tab = MvrRunner.build_tab(notebook)
         notebook.add(mvr_tab, text="MVR Runner")
     except Exception as e:
-        # Fallback: try to load directly from file path
+        # Fallback: try to load directly from file path (new folder structure)
         try:
-            mvr_path = os.path.join(APP_DIR, "Tabs", "MvrRunner.py")
+            mvr_path = os.path.join(APP_DIR, "Tabs", "MvrRunner", "main.py")
             if os.path.isfile(mvr_path):
-                spec = importlib.util.spec_from_file_location("Tabs.MvrRunner", mvr_path)
+                spec = importlib.util.spec_from_file_location("Tabs.MvrRunner.main", mvr_path)
                 mvr_mod = importlib.util.module_from_spec(spec)  # type: ignore
                 assert spec is not None and spec.loader is not None
                 spec.loader.exec_module(mvr_mod)  # type: ignore
@@ -173,11 +173,11 @@ def main():
         ollama_tab = OllamaTool.build_tab(notebook)
         notebook.add(ollama_tab, text="Ollama AI")
     except Exception as e:
-        # Fallback: try to load directly from file path
+        # Fallback: try to load directly from file path (new folder structure)
         try:
-            ollama_path = os.path.join(APP_DIR, "Tabs", "OllamaTool.py")
+            ollama_path = os.path.join(APP_DIR, "Tabs", "OllamaTool", "main.py")
             if os.path.isfile(ollama_path):
-                spec = importlib.util.spec_from_file_location("Tabs.OllamaTool", ollama_path)
+                spec = importlib.util.spec_from_file_location("Tabs.OllamaTool.main", ollama_path)
                 ollama_mod = importlib.util.module_from_spec(spec)  # type: ignore
                 assert spec is not None and spec.loader is not None
                 spec.loader.exec_module(ollama_mod)  # type: ignore
@@ -186,7 +186,7 @@ def main():
             else:
                 # File doesn't exist
                 try:
-                    sys.stderr.write(f"OllamaTool.py not found at {ollama_path}\n")
+                    sys.stderr.write(f"OllamaTool not found at {ollama_path}\n")
                 except Exception:
                     pass
         except Exception as e2:

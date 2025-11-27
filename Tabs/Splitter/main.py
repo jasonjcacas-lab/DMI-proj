@@ -14,7 +14,8 @@ import threading
 
 # ------------------ Paths ------------------
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(THIS_DIR)
+TABS_DIR = os.path.dirname(THIS_DIR)
+PROJECT_ROOT = os.path.dirname(TABS_DIR)
 DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Bindocs_output")
 RULES_PATH = os.path.join(THIS_DIR, "rules.json")
 _UI_SETTINGS_PATH = os.path.join(PROJECT_ROOT, "ui_settings.json")

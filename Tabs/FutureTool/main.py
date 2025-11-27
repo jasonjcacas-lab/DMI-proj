@@ -24,7 +24,8 @@ except ImportError:
 
 # ------------------ Paths ------------------
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_PROJECT_ROOT = os.path.dirname(_THIS_DIR)
+_TABS_DIR = os.path.dirname(_THIS_DIR)
+_PROJECT_ROOT = os.path.dirname(_TABS_DIR)
 _MODELS_DIR = os.path.join(_PROJECT_ROOT, "models")
 _DEFAULT_MODEL_PATH = os.path.join(_MODELS_DIR, "gemma-2-7b-it-Q5_K_M.gguf")
 _SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "gemma_ai_settings.json")
