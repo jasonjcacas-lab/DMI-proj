@@ -1115,50 +1115,83 @@ def build_tab(parent):
                 # Combine all document context
                 combined_text = "\n\n".join(document_context)
                 
-                # Run checkbox detection on loaded PDFs
+                # Run checkbox detection on loaded PDFs (FULL PAGE scan)
                 checkbox_info = ""
                 if _CHECKBOX_DETECTION_AVAILABLE and loaded_pdf_paths:
                     try:
+                        # Import full page detection
+                        try:
+                            from Tabs.MvrRunner.shared import _detect_checkboxes_in_pdf
+                        except ImportError:
+                            from MvrRunner.shared import _detect_checkboxes_in_pdf
+                        
                         for pdf_path in loaded_pdf_paths:
                             update_status(f"Detecting checkboxes in {os.path.basename(pdf_path)}...")
-                            checkbox_rows = _detect_checkboxes_in_rightmost_columns(pdf_path, page_num=0, num_columns=2)
                             
-                            if checkbox_rows:
-                                checkbox_info += f"\n\n=== CHECKBOX DETECTION RESULTS (from OpenCV) ===\n"
-                                checkbox_info += f"Found {len(checkbox_rows)} row(s) with checkboxes in rightmost columns:\n"
+                            # Scan FULL PAGE for checkboxes
+                            all_checkboxes = _detect_checkboxes_in_pdf(pdf_path, page_num=0, region=None)
+                            
+                            if all_checkboxes:
+                                checked_boxes = [cb for cb in all_checkboxes if cb.get('checked', False)]
                                 
-                                for row_idx, row in enumerate(checkbox_rows):
-                                    checkbox_info += f"Row {row_idx + 1}: "
-                                    for cb_idx, cb in enumerate(row):
-                                        status = "CHECKED" if cb.get('checked', False) else "UNCHECKED"
-                                        conf = cb.get('confidence', 0)
-                                        checkbox_info += f"[Box{cb_idx + 1}: {status} ({conf:.1%})] "
-                                    checkbox_info += "\n"
+                                checkbox_info += "\n\n" + "="*60 + "\n"
+                                checkbox_info += "=== CHECKBOX VALUES (OpenCV detection - USE THESE!) ===\n"
+                                checkbox_info += "="*60 + "\n"
+                                checkbox_info += f"Found {len(all_checkboxes)} checkboxes, {len(checked_boxes)} are CHECKED\n\n"
                                 
-                                # Interpret checkbox pattern for STATUS and PERSONAL USE
-                                checkbox_info += "\nInterpreted values (based on typical form layout):\n"
-                                for row_idx, row in enumerate(checkbox_rows):
-                                    if len(row) >= 2:
-                                        sorted_boxes = sorted(row, key=lambda c: c['x'])
-                                        if len(sorted_boxes) >= 4:
-                                            # 4+ boxes: [FT][PT][Y][N]
-                                            ft = sorted_boxes[0].get('checked', False)
-                                            pt = sorted_boxes[1].get('checked', False)
-                                            y = sorted_boxes[2].get('checked', False)
-                                            n = sorted_boxes[3].get('checked', False)
-                                            status_val = "FT" if ft and not pt else ("PT" if pt and not ft else "")
-                                            personal_val = "Y" if y and not n else ("N" if n and not y else "")
-                                            checkbox_info += f"  Row {row_idx + 1}: STATUS={status_val or 'unclear'}, PERSONAL_USE={personal_val or 'unclear'}\n"
-                                        elif len(sorted_boxes) >= 2:
-                                            # 2 boxes: could be just STATUS
-                                            ft = sorted_boxes[0].get('checked', False)
-                                            pt = sorted_boxes[1].get('checked', False)
-                                            status_val = "FT" if ft and not pt else ("PT" if pt and not ft else "")
-                                            checkbox_info += f"  Row {row_idx + 1}: STATUS={status_val or 'unclear'}\n"
+                                # Group by row (y-coordinate)
+                                rows = {}
+                                for cb in all_checkboxes:
+                                    row_key = cb['y'] // 50  # Group within 50 pixels vertically
+                                    if row_key not in rows:
+                                        rows[row_key] = []
+                                    rows[row_key].append(cb)
                                 
-                                checkbox_info += "=== END CHECKBOX DETECTION ===\n"
+                                # Find rows with STATUS/PERSONAL_USE checkboxes (rightmost area, x > 1200)
+                                checkbox_info += "EMPLOYEE CHECKBOX VALUES:\n"
+                                for row_key in sorted(rows.keys()):
+                                    row_boxes = sorted(rows[row_key], key=lambda c: c['x'])
+                                    # Filter to rightmost checkboxes only (likely STATUS/PERSONAL_USE)
+                                    rightmost = [cb for cb in row_boxes if cb['x'] > 1200]
+                                    
+                                    if len(rightmost) >= 2:
+                                        # Determine STATUS and PERSONAL_USE
+                                        status_val = ""
+                                        personal_val = ""
+                                        
+                                        # Sort by x position
+                                        rightmost = sorted(rightmost, key=lambda c: c['x'])
+                                        
+                                        # First checkbox pair = STATUS (FT/PT)
+                                        if rightmost[0].get('checked'):
+                                            status_val = "FT"
+                                        elif len(rightmost) > 1 and rightmost[1].get('checked'):
+                                            status_val = "PT"
+                                        
+                                        # If 4+ checkboxes, next pair = PERSONAL_USE (Y/N)
+                                        if len(rightmost) >= 4:
+                                            if rightmost[2].get('checked'):
+                                                personal_val = "Y"
+                                            elif rightmost[3].get('checked'):
+                                                personal_val = "N"
+                                        elif len(rightmost) == 2:
+                                            # Only 2 checkboxes - second might be PERSONAL_USE
+                                            if rightmost[1].get('checked'):
+                                                personal_val = "Y"
+                                        
+                                        if status_val or personal_val:
+                                            checkbox_info += f"\n  Row at y≈{row_key * 50}:\n"
+                                            checkbox_info += f"    STATUS = \"{status_val}\"  (FT=Full-Time, PT=Part-Time)\n"
+                                            checkbox_info += f"    PERSONAL_USE = \"{personal_val}\"  (Y=Yes, N=No)\n"
+                                
+                                checkbox_info += "\n" + "="*60 + "\n"
+                                checkbox_info += "USE THE ABOVE VALUES for status and personal_use fields!\n"
+                                checkbox_info += "="*60 + "\n"
+                                
                     except Exception as e:
                         checkbox_info = f"\n[Checkbox detection error: {str(e)}]\n"
+                        import traceback
+                        checkbox_info += traceback.format_exc()
                 
                 # Append checkbox info to combined text
                 if checkbox_info:
