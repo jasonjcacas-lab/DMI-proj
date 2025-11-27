@@ -1117,6 +1117,8 @@ def build_tab(parent):
                 
                 # Run checkbox detection on loaded PDFs (FULL PAGE scan)
                 checkbox_info = ""
+                detected_checkbox_values = []  # Store [{status: "FT", personal_use: "Y"}, ...] for each row
+                
                 if _CHECKBOX_DETECTION_AVAILABLE and loaded_pdf_paths:
                     try:
                         # Import full page detection
@@ -1133,6 +1135,46 @@ def build_tab(parent):
                             
                             if all_checkboxes:
                                 checked_boxes = [cb for cb in all_checkboxes if cb.get('checked', False)]
+                                
+                                # Group by row and extract STATUS/PERSONAL_USE values
+                                rows = {}
+                                for cb in all_checkboxes:
+                                    row_key = cb['y'] // 50
+                                    if row_key not in rows:
+                                        rows[row_key] = []
+                                    rows[row_key].append(cb)
+                                
+                                # Extract checkbox values for each row with rightmost checkboxes
+                                for row_key in sorted(rows.keys()):
+                                    row_boxes = sorted(rows[row_key], key=lambda c: c['x'])
+                                    rightmost = [cb for cb in row_boxes if cb['x'] > 1200]
+                                    
+                                    if len(rightmost) >= 2:
+                                        rightmost = sorted(rightmost, key=lambda c: c['x'])
+                                        status_val = ""
+                                        personal_val = ""
+                                        
+                                        # First checkbox = FT if checked
+                                        if rightmost[0].get('checked'):
+                                            status_val = "FT"
+                                        elif len(rightmost) > 1 and rightmost[1].get('checked'):
+                                            status_val = "PT"
+                                        
+                                        # Third/fourth or second checkbox = PERSONAL_USE
+                                        if len(rightmost) >= 4:
+                                            if rightmost[2].get('checked'):
+                                                personal_val = "Y"
+                                            elif rightmost[3].get('checked'):
+                                                personal_val = "N"
+                                        elif len(rightmost) >= 2 and rightmost[1].get('checked'):
+                                            personal_val = "Y"
+                                        
+                                        if status_val or personal_val:
+                                            detected_checkbox_values.append({
+                                                'status': status_val,
+                                                'personal_use': personal_val,
+                                                'row_y': row_key * 50
+                                            })
                                 
                                 checkbox_info += "\n\n" + "="*60 + "\n"
                                 checkbox_info += "=== CHECKBOX VALUES (OpenCV detection - USE THESE!) ===\n"
@@ -1444,6 +1486,26 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                                             return "IL"
                                     
                                     return state_value
+                                
+                                # FIRST: Apply checkbox values from OpenCV detection (bypasses AI for these fields!)
+                                if detected_checkbox_values:
+                                    append_to_chat("system", f"✓ Applying OpenCV checkbox detection to {len(mvr_data_list)} entries...")
+                                    for idx, entry in enumerate(mvr_data_list):
+                                        if idx < len(detected_checkbox_values):
+                                            cb_vals = detected_checkbox_values[idx]
+                                            old_status = entry.get('status', '')
+                                            old_personal = entry.get('personal_use', '')
+                                            
+                                            # Override with detected values
+                                            if cb_vals.get('status'):
+                                                entry['status'] = cb_vals['status']
+                                            if cb_vals.get('personal_use'):
+                                                entry['personal_use'] = cb_vals['personal_use']
+                                            
+                                            name = f"{entry.get('first_name', '')} {entry.get('last_name', '')}".strip()
+                                            append_to_chat("system", f"  {name}: STATUS='{entry.get('status', '')}', PERSONAL_USE='{entry.get('personal_use', '')}'")
+                                else:
+                                    append_to_chat("system", "⚠ No checkbox values detected - STATUS/PERSONAL_USE may be empty")
                                 
                                 # Apply state code fixes to all entries
                                 for idx, entry in enumerate(mvr_data_list, 1):
