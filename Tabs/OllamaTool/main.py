@@ -1119,6 +1119,10 @@ def build_tab(parent):
                 checkbox_info = ""
                 detected_checkbox_values = []  # Store [{status: "FT", personal_use: "Y"}, ...] for each row
                 
+                # Debug: show detection status
+                append_to_chat("system", f"Checkbox detection available: {_CHECKBOX_DETECTION_AVAILABLE}")
+                append_to_chat("system", f"Loaded PDF paths: {len(loaded_pdf_paths)} - {loaded_pdf_paths}")
+                
                 if _CHECKBOX_DETECTION_AVAILABLE and loaded_pdf_paths:
                     try:
                         # Import full page detection

@@ -1334,17 +1334,14 @@ def build_tab(parent):
             pdf_listbox.see(0)
             current_selected_file = manual_id
         
-        # Load the data into fields
-        fields["license_number"].delete(0, tk.END)
-        fields["license_number"].insert(0, new_data["license_number"])
-        fields["last_name"].delete(0, tk.END)
-        fields["last_name"].insert(0, new_data["last_name"])
-        fields["first_name"].delete(0, tk.END)
-        fields["first_name"].insert(0, new_data["first_name"])
-        fields["dob"].delete(0, tk.END)
-        fields["dob"].insert(0, new_data["dob"])
-        fields["state"].delete(0, tk.END)
-        fields["state"].insert(0, new_data["state"])
+        # Load the data into fields (fields are StringVars, use .set())
+        fields["license_number"].set(new_data.get("license_number", ""))
+        fields["last_name"].set(new_data.get("last_name", ""))
+        fields["first_name"].set(new_data.get("first_name", ""))
+        fields["dob"].set(new_data.get("dob", ""))
+        fields["state"].set(new_data.get("state", ""))
+        fields["status"].set(new_data.get("status", ""))
+        fields["personal_use"].set(new_data.get("personal_use", ""))
         if "extracted_text" in new_data and new_data["extracted_text"]:
             txt.delete("1.0", tk.END)
             txt.insert("1.0", new_data["extracted_text"])
