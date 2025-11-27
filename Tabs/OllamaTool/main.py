@@ -1240,12 +1240,18 @@ FIELD EXTRACTION GUIDELINES:
     - "0120" should be interpreted as "2003" (OCR error)
     - "0020" should be interpreted as "2000"
     - Always return the CORRECTED year, not the raw OCR text. Use your intelligence to interpret what the year should be.
-- STATUS field: Look for "FT" (Full-Time) or "PT" (Part-Time) - these may appear with checkbox marks
-  - OCR may read checked boxes as "EFT", "DPT", "XFT", "XPT" - these should be interpreted as "FT" or "PT"
-  - The checked box is indicated by an X mark to the left of FT or PT
-- PERSONAL USE field: Look for "Y" (Yes) or "N" (No) - these may appear with checkbox marks
-  - OCR may read checked boxes as "XY", "XN", "EY", "EN" - these should be interpreted as "Y" or "N"
-  - The checked box is indicated by an X mark to the left of Y or N
+- STATUS field: CRITICAL - DO NOT use OCR text for this field! OCR cannot read checkboxes accurately.
+  - Look for "=== CHECKBOX STATUS ===" section in the document - this contains ACCURATE checkbox readings from OpenCV
+  - If checkbox detection shows CHECKED boxes in the STATUS column area, use "FT" (Full-Time)
+  - If the first checkbox in a row is CHECKED, STATUS = "FT"
+  - If the second checkbox in a row is CHECKED (and first is not), STATUS = "PT"
+  - IGNORE any garbage text like "Bet Cer", "EFT", "DPT" - these are OCR errors
+- PERSONAL USE field: CRITICAL - DO NOT use OCR text for this field! OCR cannot read checkboxes accurately.
+  - Look for "=== CHECKBOX STATUS ===" section - this contains ACCURATE readings from OpenCV
+  - If checkbox detection shows CHECKED boxes in the PERSONAL USE column area, use "Y" (Yes)
+  - If the third checkbox in a row is CHECKED, PERSONAL USE = "Y"  
+  - If the fourth checkbox in a row is CHECKED (and third is not), PERSONAL USE = "N"
+  - IGNORE any garbage text - use ONLY the checkbox detection results
 - If you see a table with multiple columns, check ALL columns for each person's information
 - Do NOT assume fields are "Not Specified" - look carefully at the entire row for each person
 - Do NOT confuse name parts with license numbers - names are words, license numbers are codes
@@ -1839,35 +1845,68 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                                 all_checkboxes = _detect_checkboxes_in_pdf(file_path, page_num=0, region=None)
                                 
                                 if all_checkboxes:
-                                    checkbox_info = "\n\n=== CHECKBOX STATUS (detected by OpenCV image analysis) ===\n"
-                                    checkbox_info += f"Detected {len(all_checkboxes)} checkbox(es) on the page.\n\n"
+                                    checkbox_info = "\n\n" + "="*60 + "\n"
+                                    checkbox_info += "=== CHECKBOX STATUS (ACCURATE - from OpenCV image analysis) ===\n"
+                                    checkbox_info += "="*60 + "\n"
+                                    checkbox_info += "IMPORTANT: Use these values for STATUS and PERSONAL_USE fields.\n"
+                                    checkbox_info += "DO NOT use OCR text for these fields - OCR cannot read checkboxes!\n\n"
                                     
                                     checked_boxes = [cb for cb in all_checkboxes if cb.get('checked', False)]
                                     unchecked_boxes = [cb for cb in all_checkboxes if not cb.get('checked', False)]
                                     
-                                    checkbox_info += f"CHECKED checkboxes: {len(checked_boxes)}\n"
-                                    for i, cb in enumerate(checked_boxes):
-                                        checkbox_info += f"  - Checkbox {i+1}: position ({cb['x']}, {cb['y']}), fill ratio {cb.get('fill_ratio', 0):.1%}\n"
+                                    # Sort checked boxes by y-coordinate (row) then x-coordinate
+                                    checked_boxes_sorted = sorted(checked_boxes, key=lambda c: (c['y'], c['x']))
                                     
-                                    checkbox_info += f"\nUNCHECKED checkboxes: {len(unchecked_boxes)}\n"
-                                    for i, cb in enumerate(unchecked_boxes):
-                                        checkbox_info += f"  - Checkbox {i+1}: position ({cb['x']}, {cb['y']}), fill ratio {cb.get('fill_ratio', 0):.1%}\n"
+                                    checkbox_info += f"DETECTED VALUES:\n"
+                                    checkbox_info += f"- Total checkboxes found: {len(all_checkboxes)}\n"
+                                    checkbox_info += f"- CHECKED (marked with X): {len(checked_boxes)}\n"
+                                    checkbox_info += f"- UNCHECKED (empty): {len(unchecked_boxes)}\n\n"
                                     
-                                    # Try to interpret based on common form layouts
-                                    checkbox_info += "\nINTERPRETATION HINTS:\n"
-                                    checkbox_info += "- If this is an employee/MVR form, checkboxes likely indicate:\n"
-                                    checkbox_info += "  * STATUS: FT (Full-Time) or PT (Part-Time)\n"
-                                    checkbox_info += "  * PERSONAL USE: Y (Yes) or N (No)\n"
-                                    checkbox_info += f"- Based on {len(checked_boxes)} checked box(es), the most likely values are:\n"
+                                    # Group checkboxes by row (y-coordinate)
+                                    rows = {}
+                                    for cb in all_checkboxes:
+                                        row_key = cb['y'] // 30  # Group within 30 pixels
+                                        if row_key not in rows:
+                                            rows[row_key] = []
+                                        rows[row_key].append(cb)
                                     
-                                    if len(checked_boxes) >= 1:
-                                        # First checked box is likely STATUS
-                                        checkbox_info += f"  * STATUS = FT (if first checkbox means Full-Time)\n"
-                                    if len(checked_boxes) >= 2:
-                                        # Second checked box could be PERSONAL USE
-                                        checkbox_info += f"  * PERSONAL USE = Y (if second checkbox means Yes)\n"
+                                    checkbox_info += "CHECKBOX VALUES BY ROW (for employee form fields):\n"
+                                    for row_idx, (row_key, row_boxes) in enumerate(sorted(rows.items())):
+                                        row_boxes_sorted = sorted(row_boxes, key=lambda c: c['x'])
+                                        
+                                        # Determine STATUS and PERSONAL_USE for this row
+                                        status_val = ""
+                                        personal_use_val = ""
+                                        
+                                        if len(row_boxes_sorted) >= 2:
+                                            # First two boxes are usually FT/PT (STATUS)
+                                            if row_boxes_sorted[0].get('checked'):
+                                                status_val = "FT"
+                                            elif len(row_boxes_sorted) > 1 and row_boxes_sorted[1].get('checked'):
+                                                status_val = "PT"
+                                        
+                                        if len(row_boxes_sorted) >= 4:
+                                            # Third and fourth boxes are usually Y/N (PERSONAL_USE)
+                                            if row_boxes_sorted[2].get('checked'):
+                                                personal_use_val = "Y"
+                                            elif row_boxes_sorted[3].get('checked'):
+                                                personal_use_val = "N"
+                                        elif len(row_boxes_sorted) >= 2:
+                                            # If only 2 boxes, second might be PERSONAL_USE
+                                            if row_boxes_sorted[1].get('checked') and not row_boxes_sorted[0].get('checked'):
+                                                personal_use_val = "Y"
+                                            elif row_boxes_sorted[0].get('checked') and row_boxes_sorted[1].get('checked'):
+                                                # Both checked - first is STATUS=FT, second is PERSONAL_USE=Y
+                                                personal_use_val = "Y"
+                                        
+                                        if status_val or personal_use_val:
+                                            checkbox_info += f"\nRow {row_idx + 1} (y≈{row_key * 30}):\n"
+                                            checkbox_info += f"  → STATUS = \"{status_val}\" (FT=Full-Time, PT=Part-Time)\n"
+                                            checkbox_info += f"  → PERSONAL_USE = \"{personal_use_val}\" (Y=Yes, N=No)\n"
                                     
+                                    checkbox_info += "\n" + "="*60 + "\n"
                                     checkbox_info += "=== END CHECKBOX STATUS ===\n"
+                                    checkbox_info += "="*60 + "\n"
                                     document_context.append(checkbox_info)
                                     
                                     # Show in chat
