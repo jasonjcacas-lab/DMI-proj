@@ -1761,9 +1761,29 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                                                 if not name_info:
                                                     name_info = f"Entry {idx} (no name)"
                                                 
+                                                # Create a summary for extracted_text field
+                                                summary_lines = [
+                                                    "=" * 40,
+                                                    "MVR EXTRACTION SUMMARY",
+                                                    f"Source: Ollama AI + OpenCV Checkbox Detection",
+                                                    "=" * 40,
+                                                    "",
+                                                    f"Name: {mvr_data.get('first_name', '')} {mvr_data.get('last_name', '')}".strip(),
+                                                    f"License #: {mvr_data.get('license_number', '')}",
+                                                    f"State: {mvr_data.get('state', '')}",
+                                                    f"DOB: {mvr_data.get('dob', '')}",
+                                                    "",
+                                                    "--- Checkbox Fields (OpenCV) ---",
+                                                    f"Status: {mvr_data.get('status', '') or 'Not detected'}",
+                                                    f"Personal Use: {mvr_data.get('personal_use', '') or 'Not detected'}",
+                                                    "",
+                                                    "=" * 40,
+                                                ]
+                                                mvr_data['extracted_text'] = "\n".join(summary_lines)
+                                                
                                                 # Show full data being imported - explicitly show state
                                                 state_before_import = mvr_data.get('state', '')
-                                                data_preview = {k: v for k, v in mvr_data.items() if v}
+                                                data_preview = {k: v for k, v in mvr_data.items() if k != 'extracted_text' and v}
                                                 append_to_chat("system", f"Processing entry {idx}/{total_entries}: {name_info}")
                                                 append_to_chat("system", f"  State before import: '{state_before_import}'")
                                                 append_to_chat("system", f"  Full data: {data_preview}")
