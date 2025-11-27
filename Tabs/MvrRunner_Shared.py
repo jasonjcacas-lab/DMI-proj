@@ -38,6 +38,14 @@ except Exception as e:
     _IMPORT_ERRORS.append(("tkinterdnd2", str(e)))
     DND_FILES = None  # type: ignore
 
+try:
+    import cv2
+    import numpy as np
+except Exception as e:
+    _IMPORT_ERRORS.append(("opencv-python", str(e)))
+    cv2 = None  # type: ignore
+    np = None  # type: ignore
+
 
 # MVR Settings file path
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -259,6 +267,181 @@ def _get_chrome_user_data_dir():
         else:
             user_data_dir = None
     return user_data_dir if user_data_dir and os.path.exists(user_data_dir) else None
+
+
+def _detect_checkboxes_in_pdf(pdf_path: str, page_num: int = 0, region: Tuple[float, float, float, float] = None) -> list:
+    """
+    Detect checkboxes in a PDF page using OpenCV.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        page_num: Page number (0-indexed)
+        region: Optional tuple (x_ratio, y_ratio, width_ratio, height_ratio) to limit search area
+                Values are ratios of page dimensions (0.0 to 1.0)
+                Example: (0.7, 0.0, 0.3, 1.0) = rightmost 30% of page
+    
+    Returns:
+        List of dicts with checkbox info: [{'x': int, 'y': int, 'checked': bool, 'confidence': float}, ...]
+    """
+    if cv2 is None or np is None:
+        print("OpenCV not available for checkbox detection")
+        return []
+    
+    if not fitz:
+        print("PyMuPDF not available for PDF rendering")
+        return []
+    
+    try:
+        doc = fitz.open(pdf_path)
+        if page_num >= len(doc):
+            doc.close()
+            return []
+        
+        page = doc[page_num]
+        
+        # Render page to image at high DPI for better detection
+        dpi = 200
+        pix = page.get_pixmap(dpi=dpi)
+        
+        # Convert to numpy array for OpenCV
+        img_data = pix.tobytes("png")
+        nparr = np.frombuffer(img_data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        
+        doc.close()
+        
+        if img is None:
+            return []
+        
+        # Apply region filter if specified
+        h, w = img.shape[:2]
+        if region:
+            x_start = int(region[0] * w)
+            y_start = int(region[1] * h)
+            region_w = int(region[2] * w)
+            region_h = int(region[3] * h)
+            img_region = img[y_start:y_start+region_h, x_start:x_start+region_w]
+            offset_x, offset_y = x_start, y_start
+        else:
+            img_region = img
+            offset_x, offset_y = 0, 0
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(img_region, cv2.COLOR_BGR2GRAY)
+        
+        # Apply binary threshold
+        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+        
+        # Find contours
+        contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+        checkboxes = []
+        
+        # Scale factor based on DPI (checkboxes typically 10-20 pixels at 72 DPI)
+        scale = dpi / 72.0
+        min_size = int(10 * scale)
+        max_size = int(40 * scale)
+        
+        for cnt in contours:
+            x, y, box_w, box_h = cv2.boundingRect(cnt)
+            
+            # Filter by size (checkbox-like dimensions)
+            if not (min_size < box_w < max_size and min_size < box_h < max_size):
+                continue
+            
+            # Filter by aspect ratio (checkboxes are roughly square)
+            aspect_ratio = box_w / float(box_h)
+            if not (0.7 < aspect_ratio < 1.4):
+                continue
+            
+            # Check if it's filled (checked) by analyzing pixel density inside
+            roi = gray[y:y+box_h, x:x+box_w]
+            if roi.size == 0:
+                continue
+            
+            # Calculate how much of the interior is dark (filled)
+            # Exclude the border by taking inner region
+            margin = max(2, int(box_w * 0.15))
+            inner = roi[margin:-margin, margin:-margin] if margin * 2 < min(box_w, box_h) else roi
+            
+            if inner.size == 0:
+                continue
+            
+            dark_pixels = np.sum(inner < 128)
+            total_pixels = inner.size
+            fill_ratio = dark_pixels / total_pixels
+            
+            # Determine if checked based on fill ratio
+            # Empty checkbox: ~0-15% fill, Checked: >25% fill
+            is_checked = fill_ratio > 0.20
+            confidence = min(1.0, fill_ratio * 2) if is_checked else min(1.0, (0.20 - fill_ratio) * 5)
+            
+            checkboxes.append({
+                'x': x + offset_x,
+                'y': y + offset_y,
+                'width': box_w,
+                'height': box_h,
+                'checked': is_checked,
+                'fill_ratio': round(fill_ratio, 3),
+                'confidence': round(confidence, 2)
+            })
+        
+        # Sort by position (top to bottom, then left to right)
+        checkboxes.sort(key=lambda c: (c['y'] // 20, c['x']))
+        
+        return checkboxes
+        
+    except Exception as e:
+        print(f"Checkbox detection error: {e}")
+        return []
+
+
+def _detect_checkboxes_in_rightmost_columns(pdf_path: str, page_num: int = 0, num_columns: int = 2) -> list:
+    """
+    Detect checkboxes specifically in the rightmost columns of a PDF page.
+    Useful for forms where STATUS (FT/PT) and PERSONAL USE (Y/N) are in right columns.
+    
+    Args:
+        pdf_path: Path to the PDF file
+        page_num: Page number (0-indexed)
+        num_columns: Number of rightmost columns to scan (default 2)
+    
+    Returns:
+        List of checkbox info grouped by row
+    """
+    # Scan rightmost portion of page (adjust width based on num_columns)
+    # Typically each column is ~10-15% of page width
+    region_width = min(0.4, num_columns * 0.15)
+    region = (1.0 - region_width, 0.0, region_width, 1.0)
+    
+    checkboxes = _detect_checkboxes_in_pdf(pdf_path, page_num, region)
+    
+    if not checkboxes:
+        return []
+    
+    # Group checkboxes by row (similar y-coordinate)
+    row_tolerance = 15  # pixels
+    rows = []
+    current_row = []
+    last_y = -100
+    
+    for cb in checkboxes:
+        if abs(cb['y'] - last_y) > row_tolerance:
+            if current_row:
+                rows.append(current_row)
+            current_row = [cb]
+        else:
+            current_row.append(cb)
+        last_y = cb['y']
+    
+    if current_row:
+        rows.append(current_row)
+    
+    # For each row, sort checkboxes left to right
+    for row in rows:
+        row.sort(key=lambda c: c['x'])
+    
+    return rows
 
 
 def _extract_text_from_pdf(pdf_path: str) -> str:
