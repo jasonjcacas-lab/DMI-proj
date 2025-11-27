@@ -1125,17 +1125,81 @@ def build_tab(parent):
                 
                 if _CHECKBOX_DETECTION_AVAILABLE and loaded_pdf_paths:
                     try:
-                        # Import full page detection
+                        # Import detection functions
                         try:
                             from Tabs.MvrRunner.shared import _detect_checkboxes_in_pdf
                         except ImportError:
                             from MvrRunner.shared import _detect_checkboxes_in_pdf
                         
-                        for pdf_path in loaded_pdf_paths:
-                            update_status(f"Detecting checkboxes in {os.path.basename(pdf_path)}...")
+                        # Also import OpenCV for direct image detection
+                        try:
+                            import cv2
+                            import numpy as np
+                            _CV2_AVAILABLE = True
+                        except ImportError:
+                            _CV2_AVAILABLE = False
+                        
+                        for file_path in loaded_pdf_paths:
+                            update_status(f"Detecting checkboxes in {os.path.basename(file_path)}...")
                             
-                            # Scan FULL PAGE for checkboxes
-                            all_checkboxes = _detect_checkboxes_in_pdf(pdf_path, page_num=0, region=None)
+                            file_ext = os.path.splitext(file_path.lower())[1]
+                            all_checkboxes = []
+                            
+                            if file_ext == '.pdf':
+                                # Use PDF detection
+                                all_checkboxes = _detect_checkboxes_in_pdf(file_path, page_num=0, region=None)
+                            elif _CV2_AVAILABLE and file_ext in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp']:
+                                # Direct image detection with OpenCV
+                                append_to_chat("system", f"Running checkbox detection on image: {os.path.basename(file_path)}")
+                                img = cv2.imread(file_path)
+                                if img is not None:
+                                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                                    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+                                    contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                                    
+                                    h, w = img.shape[:2]
+                                    min_size = max(15, int(w * 0.01))  # At least 1% of image width
+                                    max_size = int(w * 0.05)  # At most 5% of image width
+                                    
+                                    for cnt in contours:
+                                        x, y, box_w, box_h = cv2.boundingRect(cnt)
+                                        
+                                        # Filter by size
+                                        if not (min_size < box_w < max_size and min_size < box_h < max_size):
+                                            continue
+                                        
+                                        # Filter by aspect ratio (square-ish)
+                                        aspect_ratio = box_w / float(box_h)
+                                        if not (0.7 < aspect_ratio < 1.4):
+                                            continue
+                                        
+                                        # Check fill ratio
+                                        roi = gray[y:y+box_h, x:x+box_w]
+                                        if roi.size == 0:
+                                            continue
+                                        
+                                        margin = max(2, int(box_w * 0.15))
+                                        inner = roi[margin:-margin, margin:-margin] if margin * 2 < min(box_w, box_h) else roi
+                                        
+                                        if inner.size == 0:
+                                            continue
+                                        
+                                        dark_pixels = np.sum(inner < 128)
+                                        total_pixels = inner.size
+                                        fill_ratio = dark_pixels / total_pixels
+                                        
+                                        is_checked = fill_ratio > 0.04  # 4% threshold for X marks
+                                        
+                                        all_checkboxes.append({
+                                            'x': x, 'y': y,
+                                            'width': box_w, 'height': box_h,
+                                            'checked': is_checked,
+                                            'fill_ratio': round(fill_ratio, 3)
+                                        })
+                                    
+                                    # Sort by position
+                                    all_checkboxes.sort(key=lambda c: (c['y'] // 20, c['x']))
+                                    append_to_chat("system", f"Found {len(all_checkboxes)} checkbox candidates in image")
                             
                             if all_checkboxes:
                                 checked_boxes = [cb for cb in all_checkboxes if cb.get('checked', False)]
@@ -1927,9 +1991,10 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                     cleaned_text = _clean_ocr_text(extracted_text)
                     document_context.append(cleaned_text)
                     
-                    # Track PDF path and run checkbox detection immediately
-                    if file_path.lower().endswith('.pdf'):
-                        loaded_pdf_paths.append(file_path)
+                    # Track file path for checkbox detection (PDFs and images)
+                    file_ext = os.path.splitext(file_path.lower())[1]
+                    if file_ext in ['.pdf', '.png', '.jpg', '.jpeg', '.tiff', '.bmp']:
+                        loaded_pdf_paths.append(file_path)  # renamed but still works for images too
                         
                         # Run checkbox detection on FULL PAGE and add to document context
                         if _CHECKBOX_DETECTION_AVAILABLE:
