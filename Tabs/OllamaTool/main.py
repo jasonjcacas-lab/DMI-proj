@@ -67,6 +67,26 @@ try:
 except ImportError:
     _PDFPLUMBER_AVAILABLE = False
 
+# Try to import checkbox detection from MvrRunner
+_CHECKBOX_DETECTION_AVAILABLE = False
+try:
+    from Tabs.MvrRunner.shared import _detect_checkboxes_in_rightmost_columns
+    _CHECKBOX_DETECTION_AVAILABLE = True
+except ImportError:
+    try:
+        # Fallback for direct import
+        import importlib.util
+        shared_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "MvrRunner", "shared.py")
+        if os.path.isfile(shared_path):
+            spec = importlib.util.spec_from_file_location("MvrRunner.shared", shared_path)
+            shared_mod = importlib.util.module_from_spec(spec)
+            if spec and spec.loader:
+                spec.loader.exec_module(shared_mod)
+                _detect_checkboxes_in_rightmost_columns = shared_mod._detect_checkboxes_in_rightmost_columns
+                _CHECKBOX_DETECTION_AVAILABLE = True
+    except Exception:
+        pass
+
 # ------------------ Paths ------------------
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _TABS_DIR = os.path.dirname(_THIS_DIR)
@@ -1023,6 +1043,8 @@ def build_tab(parent):
     
     # Document context (extracted text from uploaded documents)
     document_context: List[str] = []
+    # Track loaded PDF paths for checkbox detection
+    loaded_pdf_paths: List[str] = []
     
     def update_status(text):
         """Update status label"""
@@ -1093,6 +1115,55 @@ def build_tab(parent):
                 # Combine all document context
                 combined_text = "\n\n".join(document_context)
                 
+                # Run checkbox detection on loaded PDFs
+                checkbox_info = ""
+                if _CHECKBOX_DETECTION_AVAILABLE and loaded_pdf_paths:
+                    try:
+                        for pdf_path in loaded_pdf_paths:
+                            update_status(f"Detecting checkboxes in {os.path.basename(pdf_path)}...")
+                            checkbox_rows = _detect_checkboxes_in_rightmost_columns(pdf_path, page_num=0, num_columns=2)
+                            
+                            if checkbox_rows:
+                                checkbox_info += f"\n\n=== CHECKBOX DETECTION RESULTS (from OpenCV) ===\n"
+                                checkbox_info += f"Found {len(checkbox_rows)} row(s) with checkboxes in rightmost columns:\n"
+                                
+                                for row_idx, row in enumerate(checkbox_rows):
+                                    checkbox_info += f"Row {row_idx + 1}: "
+                                    for cb_idx, cb in enumerate(row):
+                                        status = "CHECKED" if cb.get('checked', False) else "UNCHECKED"
+                                        conf = cb.get('confidence', 0)
+                                        checkbox_info += f"[Box{cb_idx + 1}: {status} ({conf:.1%})] "
+                                    checkbox_info += "\n"
+                                
+                                # Interpret checkbox pattern for STATUS and PERSONAL USE
+                                checkbox_info += "\nInterpreted values (based on typical form layout):\n"
+                                for row_idx, row in enumerate(checkbox_rows):
+                                    if len(row) >= 2:
+                                        sorted_boxes = sorted(row, key=lambda c: c['x'])
+                                        if len(sorted_boxes) >= 4:
+                                            # 4+ boxes: [FT][PT][Y][N]
+                                            ft = sorted_boxes[0].get('checked', False)
+                                            pt = sorted_boxes[1].get('checked', False)
+                                            y = sorted_boxes[2].get('checked', False)
+                                            n = sorted_boxes[3].get('checked', False)
+                                            status_val = "FT" if ft and not pt else ("PT" if pt and not ft else "")
+                                            personal_val = "Y" if y and not n else ("N" if n and not y else "")
+                                            checkbox_info += f"  Row {row_idx + 1}: STATUS={status_val or 'unclear'}, PERSONAL_USE={personal_val or 'unclear'}\n"
+                                        elif len(sorted_boxes) >= 2:
+                                            # 2 boxes: could be just STATUS
+                                            ft = sorted_boxes[0].get('checked', False)
+                                            pt = sorted_boxes[1].get('checked', False)
+                                            status_val = "FT" if ft and not pt else ("PT" if pt and not ft else "")
+                                            checkbox_info += f"  Row {row_idx + 1}: STATUS={status_val or 'unclear'}\n"
+                                
+                                checkbox_info += "=== END CHECKBOX DETECTION ===\n"
+                    except Exception as e:
+                        checkbox_info = f"\n[Checkbox detection error: {str(e)}]\n"
+                
+                # Append checkbox info to combined text
+                if checkbox_info:
+                    combined_text += checkbox_info
+                
                 # Create a prompt for AI to extract MVR fields - look for multiple employees
                 extraction_prompt = """Extract ALL MVR (Motor Vehicle Record) information from the following document text. 
 This document may contain an employee list or multiple people. Extract EVERY person you find.
@@ -1104,7 +1175,9 @@ Return ONLY a JSON array of objects, where each object has these exact fields (u
     "last_name": "",
     "first_name": "",
     "dob": "",
-    "state": ""
+    "state": "",
+    "status": "",
+    "personal_use": ""
   }
 ]
 
@@ -1655,10 +1728,11 @@ Do NOT skip the state field if you see ANY text in the STATE column.
     
     def clear_conversation():
         """Clear conversation history"""
-        nonlocal conversation_history, document_context
+        nonlocal conversation_history, document_context, loaded_pdf_paths
         
         conversation_history.clear()
         document_context.clear()
+        loaded_pdf_paths.clear()
         chat_display.config(state="normal")
         chat_display.delete("1.0", "end")
         append_to_chat("system", "Conversation cleared.")
@@ -1747,6 +1821,10 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                     # Clean OCR text and store in document context (don't display in input)
                     cleaned_text = _clean_ocr_text(extracted_text)
                     document_context.append(cleaned_text)
+                    
+                    # Track PDF path for checkbox detection
+                    if file_path.lower().endswith('.pdf'):
+                        loaded_pdf_paths.append(file_path)
                     
                     # Try to extract tables from PDF
                     tables = []
