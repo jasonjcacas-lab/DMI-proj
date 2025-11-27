@@ -1826,39 +1826,53 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                     if file_path.lower().endswith('.pdf'):
                         loaded_pdf_paths.append(file_path)
                         
-                        # Run checkbox detection and add to document context
+                        # Run checkbox detection on FULL PAGE and add to document context
                         if _CHECKBOX_DETECTION_AVAILABLE:
                             try:
-                                checkbox_rows = _detect_checkboxes_in_rightmost_columns(file_path, page_num=0, num_columns=2)
-                                if checkbox_rows:
+                                # Import full page detection
+                                try:
+                                    from Tabs.MvrRunner.shared import _detect_checkboxes_in_pdf
+                                except ImportError:
+                                    from MvrRunner.shared import _detect_checkboxes_in_pdf
+                                
+                                # Scan full page for checkboxes (not just rightmost columns)
+                                all_checkboxes = _detect_checkboxes_in_pdf(file_path, page_num=0, region=None)
+                                
+                                if all_checkboxes:
                                     checkbox_info = "\n\n=== CHECKBOX STATUS (detected by OpenCV image analysis) ===\n"
-                                    checkbox_info += f"Detected {len(checkbox_rows)} row(s) with checkboxes in rightmost columns.\n"
+                                    checkbox_info += f"Detected {len(all_checkboxes)} checkbox(es) on the page.\n\n"
                                     
-                                    for row_idx, row in enumerate(checkbox_rows):
-                                        if len(row) >= 2:
-                                            sorted_boxes = sorted(row, key=lambda c: c['x'])
-                                            if len(sorted_boxes) >= 4:
-                                                # 4+ boxes: [FT][PT][Y][N] layout
-                                                ft = sorted_boxes[0].get('checked', False)
-                                                pt = sorted_boxes[1].get('checked', False)
-                                                y = sorted_boxes[2].get('checked', False)
-                                                n = sorted_boxes[3].get('checked', False)
-                                                status_val = "FT (Full-Time)" if ft and not pt else ("PT (Part-Time)" if pt and not ft else "unclear")
-                                                personal_val = "Y (Yes)" if y and not n else ("N (No)" if n and not y else "unclear")
-                                                checkbox_info += f"Row {row_idx + 1}: STATUS checkbox = {status_val}, PERSONAL USE checkbox = {personal_val}\n"
-                                            elif len(sorted_boxes) >= 2:
-                                                # 2 boxes
-                                                first = sorted_boxes[0].get('checked', False)
-                                                second = sorted_boxes[1].get('checked', False)
-                                                status_val = "FT (Full-Time)" if first and not second else ("PT (Part-Time)" if second and not first else "unclear")
-                                                checkbox_info += f"Row {row_idx + 1}: STATUS checkbox = {status_val}\n"
+                                    checked_boxes = [cb for cb in all_checkboxes if cb.get('checked', False)]
+                                    unchecked_boxes = [cb for cb in all_checkboxes if not cb.get('checked', False)]
+                                    
+                                    checkbox_info += f"CHECKED checkboxes: {len(checked_boxes)}\n"
+                                    for i, cb in enumerate(checked_boxes):
+                                        checkbox_info += f"  - Checkbox {i+1}: position ({cb['x']}, {cb['y']}), fill ratio {cb.get('fill_ratio', 0):.1%}\n"
+                                    
+                                    checkbox_info += f"\nUNCHECKED checkboxes: {len(unchecked_boxes)}\n"
+                                    for i, cb in enumerate(unchecked_boxes):
+                                        checkbox_info += f"  - Checkbox {i+1}: position ({cb['x']}, {cb['y']}), fill ratio {cb.get('fill_ratio', 0):.1%}\n"
+                                    
+                                    # Try to interpret based on common form layouts
+                                    checkbox_info += "\nINTERPRETATION HINTS:\n"
+                                    checkbox_info += "- If this is an employee/MVR form, checkboxes likely indicate:\n"
+                                    checkbox_info += "  * STATUS: FT (Full-Time) or PT (Part-Time)\n"
+                                    checkbox_info += "  * PERSONAL USE: Y (Yes) or N (No)\n"
+                                    checkbox_info += f"- Based on {len(checked_boxes)} checked box(es), the most likely values are:\n"
+                                    
+                                    if len(checked_boxes) >= 1:
+                                        # First checked box is likely STATUS
+                                        checkbox_info += f"  * STATUS = FT (if first checkbox means Full-Time)\n"
+                                    if len(checked_boxes) >= 2:
+                                        # Second checked box could be PERSONAL USE
+                                        checkbox_info += f"  * PERSONAL USE = Y (if second checkbox means Yes)\n"
                                     
                                     checkbox_info += "=== END CHECKBOX STATUS ===\n"
                                     document_context.append(checkbox_info)
                                     
                                     # Show in chat
                                     def show_checkbox_info():
-                                        append_to_chat("system", f"✓ Checkbox detection complete: Found {len(checkbox_rows)} row(s) with checkboxes")
+                                        append_to_chat("system", f"✓ Checkbox detection: Found {len(all_checkboxes)} checkbox(es) - {len(checked_boxes)} checked, {len(unchecked_boxes)} unchecked")
                                     outer.after(0, show_checkbox_info)
                             except Exception as e:
                                 print(f"Checkbox detection error: {e}")

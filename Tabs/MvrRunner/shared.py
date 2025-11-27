@@ -337,10 +337,10 @@ def _detect_checkboxes_in_pdf(pdf_path: str, page_num: int = 0, region: Tuple[fl
         
         checkboxes = []
         
-        # Scale factor based on DPI (checkboxes typically 10-20 pixels at 72 DPI)
+        # Scale factor based on DPI (checkboxes typically 8-25 pixels at 72 DPI)
         scale = dpi / 72.0
-        min_size = int(10 * scale)
-        max_size = int(40 * scale)
+        min_size = int(8 * scale)   # Lowered from 10 to 8 to catch smaller checkboxes
+        max_size = int(50 * scale)  # Increased from 40 to 50 for larger checkboxes
         
         for cnt in contours:
             x, y, box_w, box_h = cv2.boundingRect(cnt)
