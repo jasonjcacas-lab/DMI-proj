@@ -338,7 +338,7 @@ def _chat_with_ollama(api_url: str, model: str, messages: List[Dict], settings: 
         return
     
     try:
-        # Prepare the request
+        # Prepare the request - limit context to prevent long responses
         payload = {
             "model": model,
             "messages": messages,
@@ -346,14 +346,15 @@ def _chat_with_ollama(api_url: str, model: str, messages: List[Dict], settings: 
             "options": {
                 "temperature": settings.get("temperature", 0.7),
                 "top_p": settings.get("top_p", 0.9),
-                "num_predict": settings.get("max_tokens", 512),
+                "num_predict": min(settings.get("max_tokens", 512), 1024),  # Cap at 1024 tokens
+                "num_ctx": 4096,  # Limit context window
             }
         }
         
         response = requests.post(
             f"{api_url}/api/chat",
             json=payload,
-            timeout=120  # 2 minute timeout for responses
+            timeout=180  # 3 minute timeout for responses
         )
         
         if response.status_code == 200:
@@ -833,31 +834,415 @@ def format_table_as_text(table_data: List[List[str]]) -> str:
     return "\n".join(formatted_rows)
 
 
+# ==================== DOCUMENT TYPE DETECTION ====================
+# Cues for identifying Dealer Applications (same as Binder Splitter)
+_DEALER_APP_CUES = [
+    r'(?i)\bDEALER\s+APPLICATION\b',
+    r'(?i)\bNEW\s+BUSINESS\s+QUOTE\b',
+    r'(?i)\bRENEWAL\s+OF\s+POL\b',
+]
+
+# Cues for page 2 employee tables
+_EMPLOYEE_TABLE_CUES = [
+    r'(?i)\bBUSINESS\s+PERSONNEL\b',
+    r'(?i)\bNON\s*-?\s*BUSINESS\s+PERSONNEL\b',
+    r'(?i)\bLIST\s+ALL\s+OWNERS\s*/?\s*OFFICERS\b',
+    r'(?i)\bLIST\s+ALL\s+SPOUSES\b',
+]
+
+
+def _detect_pdf_type(file_path: str) -> Dict:
+    """
+    Detect if a PDF is text-based or scanned, and if it's a dealer application.
+    
+    Returns:
+        {
+            "is_text_based": bool,  # True if PDF has text layer
+            "is_scanned": bool,     # True if PDF appears to be scanned (no text layer)
+            "is_dealer_app": bool,  # True if it's a dealer application
+            "has_employee_tables": bool,  # True if it has BUSINESS/NON-BUSINESS PERSONNEL
+            "employee_table_pages": list,  # Page numbers (0-indexed) with employee tables
+            "text_layer": str,      # Extracted text layer (if any)
+        }
+    """
+    import re
+    
+    result = {
+        "is_text_based": False,
+        "is_scanned": True,
+        "is_dealer_app": False,
+        "has_employee_tables": False,
+        "employee_table_pages": [],
+        "text_layer": "",
+    }
+    
+    if not _PYMUPDF_AVAILABLE:
+        return result
+    
+    try:
+        doc = fitz.open(file_path)
+        text_parts = []
+        total_text_chars = 0
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            page_text = page.get_text()
+            text_parts.append(page_text)
+            total_text_chars += len(page_text.strip())
+            
+            # Check if this page has employee tables
+            for pattern in _EMPLOYEE_TABLE_CUES:
+                if re.search(pattern, page_text):
+                    if page_num not in result["employee_table_pages"]:
+                        result["employee_table_pages"].append(page_num)
+                    result["has_employee_tables"] = True
+        
+        doc.close()
+        
+        # Combine text for analysis
+        full_text = "\n\n".join([f"--- Page {i+1} ---\n{t}" for i, t in enumerate(text_parts) if t.strip()])
+        result["text_layer"] = full_text
+        
+        # Determine if text-based or scanned
+        # A text-based PDF has substantial text (>500 chars for multi-page doc)
+        if total_text_chars > 500:
+            result["is_text_based"] = True
+            result["is_scanned"] = False
+        
+        # Check if it's a dealer application
+        for pattern in _DEALER_APP_CUES:
+            if re.search(pattern, full_text):
+                result["is_dealer_app"] = True
+                break
+        
+    except Exception as e:
+        pass
+    
+    return result
+
+
+def _extract_page_as_image(file_path: str, page_num: int) -> Optional[Image.Image]:
+    """
+    Extract a specific page from a PDF as a PIL Image.
+    This allows processing it like a pasted screenshot.
+    """
+    if not _PYMUPDF_AVAILABLE or not _PIL_AVAILABLE:
+        return None
+    
+    try:
+        from io import BytesIO
+        
+        doc = fitz.open(file_path)
+        if page_num >= len(doc):
+            doc.close()
+            return None
+        
+        page = doc[page_num]
+        # 2x zoom for good quality (same as clipboard images)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        img_data = pix.tobytes("png")
+        doc.close()
+        
+        img = Image.open(BytesIO(img_data))
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        return img
+        
+    except Exception as e:
+        print(f"Error extracting page as image: {e}")
+        return None
+
+
+def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
+    """
+    Process a dealer application page image - same approach as clipboard paste.
+    Uses EasyOCR for table detection + checkbox detection for FT/PT and Y/N fields.
+    
+    Returns:
+        Dict with 'text', 'tables', 'checkboxes', 'context'
+    """
+    import numpy as np
+    
+    result = {
+        'text': '',
+        'tables': [],
+        'checkboxes': [],
+        'context': ''
+    }
+    
+    if not _PIL_AVAILABLE or img is None:
+        return result
+    
+    # Convert to numpy array
+    img_array = np.array(img)
+    
+    extracted_text = None
+    tables = []
+    
+    # ===== EASYOCR FOR TABLE DETECTION =====
+    if _EASYOCR_AVAILABLE and img_array is not None:
+        try:
+            append_to_chat("system", "🔍 Running EasyOCR for table detection...")
+            reader = easyocr.Reader(['en'], gpu=False)
+            ocr_result = reader.readtext(img_array, detail=1, paragraph=False, mag_ratio=1.5, min_size=10, width_ths=0.3, height_ths=0.3)
+            
+            if ocr_result:
+                text_lines = []
+                lines = []
+                
+                for line_result in ocr_result:
+                    if line_result and len(line_result) >= 2:
+                        text = line_result[1] if isinstance(line_result[1], str) else str(line_result[1])
+                        if text and text.strip():
+                            text_lines.append(text.strip())
+                            bbox = line_result[0]
+                            if bbox and len(bbox) >= 4:
+                                y_center = sum([point[1] for point in bbox]) / len(bbox)
+                                lines.append((y_center, text.strip(), bbox))
+                
+                # Detect table structure
+                if lines:
+                    lines.sort(key=lambda x: x[0])
+                    rows = []
+                    current_row = []
+                    current_y = None
+                    y_threshold = 20
+                    
+                    for y, text, bbox in lines:
+                        if current_y is None or abs(y - current_y) < y_threshold:
+                            current_row.append((text, bbox))
+                            current_y = y
+                        else:
+                            if current_row:
+                                current_row.sort(key=lambda x: sum([p[0] for p in x[1]]) / len(x[1]))
+                                rows.append([cell[0] for cell in current_row])
+                            current_row = [(text, bbox)]
+                            current_y = y
+                    
+                    if current_row:
+                        current_row.sort(key=lambda x: sum([p[0] for p in x[1]]) / len(x[1]))
+                        rows.append([cell[0] for cell in current_row])
+                    
+                    if len(rows) > 1:
+                        tables.append({"page": page_num, "table": rows, "method": "easyocr"})
+                        append_to_chat("system", f"✓ Detected table with {len(rows)} rows")
+                
+                extracted_text = "\n".join(text_lines) if text_lines else None
+                append_to_chat("system", f"✓ EasyOCR extracted {len(text_lines)} text items")
+                
+        except Exception as e:
+            append_to_chat("system", f"EasyOCR error: {str(e)}")
+    
+    # ===== TESSERACT FALLBACK =====
+    if not extracted_text and _TESSERACT_AVAILABLE:
+        try:
+            append_to_chat("system", "🔍 Running Tesseract OCR (fallback)...")
+            tesseract_text = pytesseract.image_to_string(img, config='--psm 6')
+            if tesseract_text and tesseract_text.strip():
+                extracted_text = tesseract_text
+                append_to_chat("system", f"✓ Tesseract extracted {len(tesseract_text)} characters")
+        except Exception as e:
+            append_to_chat("system", f"Tesseract error: {str(e)}")
+    
+    # ===== CHECKBOX DETECTION (critical for FT/PT and Y/N) =====
+    checkbox_info = ""
+    checkboxes = []
+    if _CHECKBOX_DETECTION_AVAILABLE:
+        try:
+            from Tabs.MvrRunner.checkbox_detection import detect_checkboxes_in_image
+            append_to_chat("system", "☑️ Running checkbox detection for FT/PT and Y/N fields...")
+            update_status("Detecting checkboxes on employee table...")
+            
+            checkbox_results = detect_checkboxes_in_image(img)
+            
+            if checkbox_results:
+                checked = [cb for cb in checkbox_results if cb.get('checked', False)]
+                unchecked = [cb for cb in checkbox_results if not cb.get('checked', False)]
+                append_to_chat("system", f"✓ Found {len(checked)} checked, {len(unchecked)} unchecked checkboxes")
+                checkboxes = checkbox_results
+                
+                checkbox_lines = []
+                for cb in checkbox_results:
+                    status = "☑" if cb.get('checked', False) else "☐"
+                    label = cb.get('label', cb.get('text', 'unknown'))
+                    checkbox_lines.append(f"{status} {label}")
+                
+                if checkbox_lines:
+                    checkbox_info = "\n=== CHECKBOX STATUS ===\n" + "\n".join(checkbox_lines)
+                    
+        except Exception as e:
+            append_to_chat("system", f"Checkbox detection error: {str(e)}")
+    
+    # ===== BUILD CONTEXT =====
+    context_parts = [f"=== DEALER APPLICATION - PAGE {page_num} (Employee Tables) ==="]
+    
+    if tables:
+        for tbl in tables:
+            context_parts.append("\n--- Employee Table ---")
+            for row_idx, row in enumerate(tbl["table"]):
+                if row_idx == 0:
+                    context_parts.append("HEADERS: " + " | ".join(row))
+                else:
+                    context_parts.append(f"Row {row_idx}: " + " | ".join(row))
+    
+    if extracted_text:
+        context_parts.append(f"\n--- Raw OCR Text ---")
+        context_parts.append(extracted_text)
+    
+    if checkbox_info:
+        context_parts.append(checkbox_info)
+    
+    result['text'] = extracted_text or ''
+    result['tables'] = tables
+    result['checkboxes'] = checkboxes
+    result['context'] = "\n".join(context_parts)
+    
+    return result
+
+
+def _ocr_specific_pages(file_path: str, page_numbers: List[int], ocr_engine: str = "tesseract") -> str:
+    """
+    OCR specific pages of a PDF (e.g., page 2 for employee tables).
+    Uses Tesseract by default (fast) or EasyOCR if specified.
+    
+    Args:
+        file_path: Path to PDF
+        page_numbers: List of page numbers to OCR (0-indexed)
+        ocr_engine: "tesseract" (fast) or "easyocr" (slower but better for tables)
+    
+    Returns:
+        OCR text from specified pages
+    """
+    if not _PYMUPDF_AVAILABLE or not _PIL_AVAILABLE:
+        return ""
+    
+    # Always prefer Tesseract for speed - EasyOCR is very slow
+    use_tesseract = _TESSERACT_AVAILABLE
+    
+    if not use_tesseract and not _EASYOCR_AVAILABLE:
+        return "No OCR engine available"
+    
+    try:
+        from io import BytesIO
+        
+        text_parts = []
+        doc = fitz.open(file_path)
+        
+        # Initialize EasyOCR reader ONCE if needed (this is the slow part)
+        easyocr_reader = None
+        if not use_tesseract and _EASYOCR_AVAILABLE:
+            import numpy as np
+            easyocr_reader = easyocr.Reader(['en'], gpu=False)
+        
+        for page_num in page_numbers:
+            if page_num >= len(doc):
+                continue
+            
+            page = doc[page_num]
+            # Convert page to image for OCR (1.5x zoom - balance of speed vs quality)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+            img_data = pix.tobytes("png")
+            img = Image.open(BytesIO(img_data))
+            
+            page_text = ""
+            
+            if use_tesseract:
+                # Tesseract is fast
+                page_text = pytesseract.image_to_string(img, lang='eng')
+            elif easyocr_reader:
+                # EasyOCR - already initialized
+                import numpy as np
+                img_array = np.array(img)
+                result = easyocr_reader.readtext(img_array, detail=1)
+                if result:
+                    page_text = _format_ocr_results_as_table(result, img.width)
+            
+            if page_text.strip():
+                text_parts.append(f"--- Page {page_num + 1} (OCR) ---\n{page_text}")
+        
+        doc.close()
+        return "\n\n".join(text_parts)
+        
+    except Exception as e:
+        return f"OCR error: {str(e)}"
+
+
+def _format_ocr_results_as_table(ocr_results: list, img_width: int = 0) -> str:
+    """Format EasyOCR results preserving table row/column structure."""
+    if not ocr_results:
+        return ""
+    
+    # Extract text with position info
+    items = []
+    for item in ocr_results:
+        if len(item) >= 2:
+            bbox, text = item[0], item[1]
+            if text and text.strip():
+                x_center = sum(p[0] for p in bbox) / len(bbox)
+                y_center = sum(p[1] for p in bbox) / len(bbox)
+                items.append({'text': text.strip(), 'x': x_center, 'y': y_center})
+    
+    if not items:
+        return ""
+    
+    # Sort by Y then X
+    items.sort(key=lambda i: (i['y'], i['x']))
+    
+    # Group into rows by Y coordinate
+    rows = []
+    current_row = []
+    current_y = None
+    row_threshold = 25
+    
+    for item in items:
+        if current_y is None or abs(item['y'] - current_y) <= row_threshold:
+            current_row.append(item)
+            current_y = item['y'] if current_y is None else current_y
+        else:
+            if current_row:
+                current_row.sort(key=lambda i: i['x'])
+                rows.append(current_row)
+            current_row = [item]
+            current_y = item['y']
+    
+    if current_row:
+        current_row.sort(key=lambda i: i['x'])
+        rows.append(current_row)
+    
+    # Format as tab-separated text
+    return "\n".join("\t".join(item['text'] for item in row) for row in rows)
+
+
 def extract_text_from_document(file_path: str, ocr_engine: str = "tesseract", api_url: str = None, vision_model: str = None, settings: Dict = None) -> str:
-    """Extract text from a document (PDF or image) using the specified method"""
+    """
+    Extract text from a document (PDF or image).
+    
+    Smart detection:
+    - Text-based PDFs: Use text extraction (fast)
+    - Scanned PDFs: Use OCR
+    - Dealer Applications: OCR page 2 (employee tables) - done separately via ocr_dealer_app_page2()
+    """
     if not os.path.isfile(file_path):
         return f"File not found: {file_path}"
     
-    # Try to extract text directly from PDF first (if it has text layer)
+    # For PDFs, try text extraction first
     if file_path.lower().endswith('.pdf') and _PYMUPDF_AVAILABLE:
-        try:
-            doc = fitz.open(file_path)
-            text_parts = []
-            for page_num in range(len(doc)):
-                page = doc[page_num]
-                page_text = page.get_text()
-                if page_text.strip():
-                    text_parts.append(f"--- Page {page_num + 1} ---\n{page_text}")
-            doc.close()
+        pdf_info = _detect_pdf_type(file_path)
+        
+        # If it has text layer, return it (fast path)
+        if pdf_info["is_text_based"] and pdf_info["text_layer"]:
+            result = pdf_info["text_layer"]
             
-            # If we got substantial text, return it (no OCR needed)
-            full_text = "\n\n".join(text_parts)
-            if len(full_text.strip()) > 100:  # If we have substantial text
-                return full_text
-        except Exception:
-            pass  # Fall through to OCR/vision
+            # Add metadata about document type
+            if pdf_info["is_dealer_app"]:
+                result = f"[DOCUMENT TYPE: Dealer Application]\n[HAS EMPLOYEE TABLES: {pdf_info['has_employee_tables']}]\n[EMPLOYEE TABLE PAGES: {pdf_info['employee_table_pages']}]\n\n{result}"
+            
+            return result
+        
+        # Scanned PDF - fall through to OCR
     
-    # Use OCR or vision model
+    # Use OCR for scanned PDFs or images
     if ocr_engine.lower() == "ollama_vision":
         if not api_url:
             api_url = "http://localhost:11434"
@@ -872,6 +1257,24 @@ def extract_text_from_document(file_path: str, ocr_engine: str = "tesseract", ap
         result = _extract_text_with_tesseract(file_path)
     
     return result if result else "No text could be extracted from the document."
+
+
+def ocr_dealer_app_page2(file_path: str, ocr_engine: str = "tesseract") -> str:
+    """
+    OCR specifically page 2 of a dealer application (employee tables).
+    Call this separately when you need the filled-in employee data.
+    
+    Returns:
+        OCR text from page 2 (employee tables)
+    """
+    pdf_info = _detect_pdf_type(file_path)
+    
+    if not pdf_info["has_employee_tables"]:
+        return "No employee tables found in this document."
+    
+    # OCR the employee table pages
+    pages = pdf_info["employee_table_pages"] if pdf_info["employee_table_pages"] else [1]  # Default to page 2
+    return _ocr_specific_pages(file_path, pages, ocr_engine)
 
 
 def build_tab(parent):
@@ -1439,7 +1842,7 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                 response = requests.post(
                     f"{settings['api_url']}/api/chat",
                     json=payload,
-                    timeout=60
+                    timeout=180  # 3 minute timeout for document extraction
                 )
                 
                 if response.status_code == 200:
@@ -1889,23 +2292,35 @@ Do NOT skip the state field if you see ANY text in the STATE column.
         # Clear input
         input_text.delete("1.0", "end")
         
-        # Add document context if available
+        # Add document context if available - LIMIT SIZE to prevent timeout
         full_message = user_input
         if document_context:
-            context_text = "\n\n".join([f"--- Document Content ---\n{ctx}" for ctx in document_context[-3:]])  # Include last 3 documents
-            full_message = f"{context_text}\n\n--- User Question ---\n{user_input}"
-            # Clear document context after using it (optional - remove this line if you want to keep context)
-            # document_context.clear()
+            # Combine document context but limit total size to 8000 chars
+            max_context_chars = 8000
+            combined_context = ""
+            for ctx in document_context[-2:]:  # Last 2 documents max
+                if len(combined_context) + len(ctx) < max_context_chars:
+                    combined_context += f"\n\n--- Document Content ---\n{ctx}"
+                else:
+                    # Truncate if too long
+                    remaining = max_context_chars - len(combined_context)
+                    if remaining > 500:
+                        combined_context += f"\n\n--- Document Content (truncated) ---\n{ctx[:remaining]}..."
+                    break
+            
+            if combined_context:
+                full_message = f"{combined_context}\n\n--- User Question ---\n{user_input}"
+                append_to_chat("system", f"📄 Context: {len(combined_context)} chars sent to AI")
         
         # Add to conversation
         append_to_chat("user", user_input)
         conversation_history.append({"role": "user", "content": full_message})
         
-        # Prepare messages for API (keep last 20 messages for context)
-        api_messages = conversation_history[-20:]
+        # Prepare messages for API (keep last 10 messages for context - reduced from 20)
+        api_messages = conversation_history[-10:]
         
-        # Update status
-        update_status("Thinking...")
+        # Update status with model info
+        update_status(f"Thinking... (using {settings.get('model', 'default')})")
         
         # Run chat in background thread
         chat_thread = threading.Thread(
@@ -1968,6 +2383,63 @@ Do NOT skip the state field if you see ANY text in the STATE column.
         
         def ocr_worker():
             try:
+                update_status("Analyzing document...")
+                
+                # First, detect if this is a dealer application
+                pdf_info = None
+                if file_path.lower().endswith('.pdf'):
+                    pdf_info = _detect_pdf_type(file_path)
+                
+                # ===== DEALER APPLICATION SPECIAL HANDLING =====
+                # Process page 2 (employee tables) as an IMAGE, like a pasted screenshot
+                if pdf_info and pdf_info.get("is_dealer_app") and pdf_info.get("has_employee_tables"):
+                    append_to_chat("system", "📋 DEALER APPLICATION detected!")
+                    append_to_chat("system", f"   Employee table pages: {[p+1 for p in pdf_info['employee_table_pages']]}")
+                    
+                    all_context = []
+                    
+                    # Process each employee table page as an image
+                    for page_num in pdf_info["employee_table_pages"]:
+                        update_status(f"Processing page {page_num + 1} as image (like screenshot)...")
+                        append_to_chat("system", f"📸 Extracting page {page_num + 1} as image for OCR...")
+                        
+                        # Extract page as image (like a pasted screenshot)
+                        page_img = _extract_page_as_image(file_path, page_num)
+                        if page_img:
+                            # Process using same approach as clipboard paste
+                            result = _process_dealer_app_image(page_img, page_num + 1, append_to_chat, update_status)
+                            
+                            if result['context']:
+                                all_context.append(result['context'])
+                                
+                                # Show summary
+                                append_to_chat("system", f"\n✅ Page {page_num + 1} processed!")
+                                append_to_chat("system", f"   • {len(result['tables'])} table(s) detected")
+                                append_to_chat("system", f"   • {len(result['text'])} chars of text")
+                                if result['checkboxes']:
+                                    checked = len([c for c in result['checkboxes'] if c.get('checked')])
+                                    append_to_chat("system", f"   • {len(result['checkboxes'])} checkboxes ({checked} checked)")
+                    
+                    # Store combined context
+                    if all_context:
+                        full_context = "\n\n".join(all_context)
+                        document_context.append(full_context)
+                        loaded_pdf_paths.append(file_path)
+                        
+                        # Update document context display
+                        if hasattr(outer, '_doc_context_display'):
+                            outer._doc_context_display.configure(state='normal')
+                            outer._doc_context_display.delete('1.0', 'end')
+                            display_text = full_context[:3000] + "..." if len(full_context) > 3000 else full_context
+                            outer._doc_context_display.insert('1.0', display_text)
+                            outer._doc_context_display.configure(state='disabled')
+                        
+                        append_to_chat("system", "\n💡 You can now ask: 'List all employees and their info'")
+                    
+                    update_status("Dealer application processed - ready for questions")
+                    return
+                
+                # ===== REGULAR DOCUMENT HANDLING =====
                 update_status("Extracting text from document...")
                 ocr_engine = settings.get("ocr_engine", "tesseract")
                 
