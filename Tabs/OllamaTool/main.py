@@ -338,38 +338,51 @@ def _chat_with_ollama(api_url: str, model: str, messages: List[Dict], settings: 
         return
     
     try:
-        # Prepare the request - limit context to prevent long responses
+        # Prepare the request - use STREAMING for no timeout
         payload = {
             "model": model,
             "messages": messages,
-            "stream": False,
+            "stream": True,  # Stream response chunks
             "options": {
-                "temperature": settings.get("temperature", 0.7),
-                "top_p": settings.get("top_p", 0.9),
-                "num_predict": min(settings.get("max_tokens", 512), 1024),  # Cap at 1024 tokens
-                "num_ctx": 4096,  # Limit context window
+                "temperature": 0.3,
+                "num_predict": 256,  # Very short response
+                "num_ctx": 2048,
             }
         }
         
+        # Use streaming to avoid timeout
         response = requests.post(
             f"{api_url}/api/chat",
             json=payload,
-            timeout=180  # 3 minute timeout for responses
+            stream=True,
+            timeout=30  # Just 30 sec to START responding
         )
         
         if response.status_code == 200:
-            data = response.json()
-            if "message" in data and "content" in data["message"]:
-                callback(True, data["message"]["content"])
+            full_response = ""
+            for line in response.iter_lines():
+                if line:
+                    try:
+                        import json
+                        chunk = json.loads(line)
+                        if "message" in chunk and "content" in chunk["message"]:
+                            full_response += chunk["message"]["content"]
+                        if chunk.get("done", False):
+                            break
+                    except:
+                        continue
+            
+            if full_response:
+                callback(True, full_response)
             else:
-                callback(False, f"Unexpected response format: {data}")
+                callback(False, "No response from model")
         else:
-            callback(False, f"API error: {response.status_code} - {response.text}")
+            callback(False, f"API error: {response.status_code}")
     
     except requests.exceptions.ConnectionError:
         callback(False, "Cannot connect to Ollama. Make sure Ollama is running.")
     except requests.exceptions.Timeout:
-        callback(False, "Request timed out. The model may be taking too long to respond.")
+        callback(False, "Request timed out starting. Try a smaller/faster model like phi3:mini")
     except Exception as e:
         callback(False, f"Error: {str(e)}")
 
@@ -897,11 +910,18 @@ def _detect_pdf_type(file_path: str) -> Dict:
                         result["employee_table_pages"].append(page_num)
                     result["has_employee_tables"] = True
         
+        num_pages = len(doc)
         doc.close()
         
         # Combine text for analysis
         full_text = "\n\n".join([f"--- Page {i+1} ---\n{t}" for i, t in enumerate(text_parts) if t.strip()])
         result["text_layer"] = full_text
+        
+        # Check if it's a dealer application FIRST (before we use it in logic below)
+        for pattern in _DEALER_APP_CUES:
+            if re.search(pattern, full_text):
+                result["is_dealer_app"] = True
+                break
         
         # Determine if text-based or scanned
         # A text-based PDF has substantial text (>500 chars for multi-page doc)
@@ -909,11 +929,12 @@ def _detect_pdf_type(file_path: str) -> Dict:
             result["is_text_based"] = True
             result["is_scanned"] = False
         
-        # Check if it's a dealer application
-        for pattern in _DEALER_APP_CUES:
-            if re.search(pattern, full_text):
-                result["is_dealer_app"] = True
-                break
+        # IMPORTANT: For scanned PDFs, we can't detect employee tables from text
+        # If it's a dealer app and we didn't find employee table pages, assume page 2 (index 1)
+        if result["is_dealer_app"] and not result["employee_table_pages"]:
+            if num_pages >= 2:
+                result["employee_table_pages"] = [1]  # Page 2 = index 1
+                result["has_employee_tables"] = True
         
     except Exception as e:
         pass
@@ -938,8 +959,8 @@ def _extract_page_as_image(file_path: str, page_num: int) -> Optional[Image.Imag
             return None
         
         page = doc[page_num]
-        # 2x zoom for good quality (same as clipboard images)
-        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        # 3x zoom for better OCR quality (higher = better accuracy but slower)
+        pix = page.get_pixmap(matrix=fitz.Matrix(3, 3))
         img_data = pix.tobytes("png")
         doc.close()
         
@@ -954,14 +975,63 @@ def _extract_page_as_image(file_path: str, page_num: int) -> Optional[Image.Imag
         return None
 
 
+def _detect_table_with_opencv(img_array, append_to_chat):
+    """
+    Use OpenCV to detect table structure (horizontal and vertical lines).
+    Returns list of row Y-coordinates and column X-coordinates.
+    """
+    import cv2
+    import numpy as np
+    
+    # Convert to grayscale
+    if len(img_array.shape) == 3:
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img_array
+    
+    # Binary threshold
+    _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    
+    # Detect horizontal lines
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (80, 1))
+    horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+    
+    # Detect vertical lines
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 40))
+    vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=2)
+    
+    # Find horizontal line Y positions
+    h_contours, _ = cv2.findContours(horizontal_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    row_ys = []
+    for cnt in h_contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if w > 100:  # Significant horizontal line
+            row_ys.append(y)
+    row_ys = sorted(set(row_ys))
+    
+    # Find vertical line X positions
+    v_contours, _ = cv2.findContours(vertical_lines, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    col_xs = []
+    for cnt in v_contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        if h > 50:  # Significant vertical line
+            col_xs.append(x)
+    col_xs = sorted(set(col_xs))
+    
+    append_to_chat("system", f"   OpenCV detected {len(row_ys)} horizontal lines, {len(col_xs)} vertical lines")
+    
+    return row_ys, col_xs
+
+
 def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
     """
-    Process a dealer application page image - same approach as clipboard paste.
-    Uses EasyOCR for table detection + checkbox detection for FT/PT and Y/N fields.
+    Process a dealer application page image.
+    Uses OpenCV to detect table structure + EasyOCR to read cells.
     
     Returns:
         Dict with 'text', 'tables', 'checkboxes', 'context'
     """
+    import cv2
     import numpy as np
     
     result = {
@@ -974,129 +1044,395 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
     if not _PIL_AVAILABLE or img is None:
         return result
     
-    # Convert to numpy array
-    img_array = np.array(img)
-    
     extracted_text = None
     tables = []
+    table_rows = []
     
-    # ===== EASYOCR FOR TABLE DETECTION =====
-    if _EASYOCR_AVAILABLE and img_array is not None:
+    # Convert to numpy array
+    img_array = np.array(img)
+    img_height, img_width = img_array.shape[:2]
+    
+    append_to_chat("system", f"🖼️ Image size: {img_width}x{img_height} pixels")
+    
+    # ===== STEP 1: Use OpenCV to detect table structure =====
+    append_to_chat("system", "📐 Step 1: Detecting table structure with OpenCV...")
+    row_ys, col_xs = _detect_table_with_opencv(img_array, append_to_chat)
+    
+    # ===== STEP 2: Use EasyOCR to read the entire image =====
+    append_to_chat("system", "🔍 Step 2: Running EasyOCR to extract text...")
+    update_status("Running EasyOCR - this may take 30-60 seconds...")
+    
+    all_text_items = []  # List of (x, y, text, bbox)
+    
+    if _EASYOCR_AVAILABLE:
         try:
-            append_to_chat("system", "🔍 Running EasyOCR for table detection...")
             reader = easyocr.Reader(['en'], gpu=False)
             ocr_result = reader.readtext(img_array, detail=1, paragraph=False, mag_ratio=1.5, min_size=10, width_ths=0.3, height_ths=0.3)
             
-            if ocr_result:
-                text_lines = []
-                lines = []
-                
-                for line_result in ocr_result:
-                    if line_result and len(line_result) >= 2:
-                        text = line_result[1] if isinstance(line_result[1], str) else str(line_result[1])
-                        if text and text.strip():
-                            text_lines.append(text.strip())
-                            bbox = line_result[0]
-                            if bbox and len(bbox) >= 4:
-                                y_center = sum([point[1] for point in bbox]) / len(bbox)
-                                lines.append((y_center, text.strip(), bbox))
-                
-                # Detect table structure
-                if lines:
-                    lines.sort(key=lambda x: x[0])
-                    rows = []
-                    current_row = []
-                    current_y = None
-                    y_threshold = 20
-                    
-                    for y, text, bbox in lines:
-                        if current_y is None or abs(y - current_y) < y_threshold:
-                            current_row.append((text, bbox))
-                            current_y = y
-                        else:
-                            if current_row:
-                                current_row.sort(key=lambda x: sum([p[0] for p in x[1]]) / len(x[1]))
-                                rows.append([cell[0] for cell in current_row])
-                            current_row = [(text, bbox)]
-                            current_y = y
-                    
-                    if current_row:
-                        current_row.sort(key=lambda x: sum([p[0] for p in x[1]]) / len(x[1]))
-                        rows.append([cell[0] for cell in current_row])
-                    
-                    if len(rows) > 1:
-                        tables.append({"page": page_num, "table": rows, "method": "easyocr"})
-                        append_to_chat("system", f"✓ Detected table with {len(rows)} rows")
-                
-                extracted_text = "\n".join(text_lines) if text_lines else None
-                append_to_chat("system", f"✓ EasyOCR extracted {len(text_lines)} text items")
-                
+            for line_result in ocr_result:
+                if line_result and len(line_result) >= 2:
+                    text = line_result[1] if isinstance(line_result[1], str) else str(line_result[1])
+                    if text and text.strip():
+                        bbox = line_result[0]
+                        if bbox and len(bbox) >= 4:
+                            x_center = sum([point[0] for point in bbox]) / len(bbox)
+                            y_center = sum([point[1] for point in bbox]) / len(bbox)
+                            all_text_items.append((x_center, y_center, text.strip(), bbox))
+            
+            append_to_chat("system", f"   ✓ EasyOCR found {len(all_text_items)} text items")
+            
         except Exception as e:
-            append_to_chat("system", f"EasyOCR error: {str(e)}")
+            append_to_chat("system", f"   EasyOCR error: {str(e)}")
     
-    # ===== TESSERACT FALLBACK =====
-    if not extracted_text and _TESSERACT_AVAILABLE:
-        try:
-            append_to_chat("system", "🔍 Running Tesseract OCR (fallback)...")
-            tesseract_text = pytesseract.image_to_string(img, config='--psm 6')
-            if tesseract_text and tesseract_text.strip():
-                extracted_text = tesseract_text
-                append_to_chat("system", f"✓ Tesseract extracted {len(tesseract_text)} characters")
-        except Exception as e:
-            append_to_chat("system", f"Tesseract error: {str(e)}")
+    # ===== STEP 3: Organize text into table rows using detected lines OR Y-clustering =====
+    append_to_chat("system", "📊 Step 3: Organizing text into table rows...")
+    
+    # Store rows WITH their Y-positions for checkbox matching
+    table_rows_with_y = []  # List of (avg_y, [text1, text2, ...])
+    
+    if row_ys and len(row_ys) > 2:
+        # Use detected horizontal lines to group rows
+        append_to_chat("system", f"   Using {len(row_ys)} detected row lines")
+        
+        # Create row boundaries
+        row_boundaries = []
+        for i in range(len(row_ys) - 1):
+            row_boundaries.append((row_ys[i], row_ys[i + 1]))
+        
+        # Assign text items to rows
+        for y_start, y_end in row_boundaries:
+            row_items = [(x, y, text, bbox) for x, y, text, bbox in all_text_items 
+                        if y_start <= y <= y_end]
+            if row_items:
+                row_items.sort(key=lambda item: item[0])  # Sort by X
+                row_texts = [item[2] for item in row_items]
+                avg_y = sum(item[1] for item in row_items) / len(row_items)
+                table_rows.append(row_texts)
+                table_rows_with_y.append((avg_y, row_texts))
+    else:
+        # Fallback: Use Y-clustering (like PNG method)
+        append_to_chat("system", "   No table lines detected, using Y-clustering")
+        
+        if all_text_items:
+            all_text_items.sort(key=lambda item: item[1])  # Sort by Y
+            
+            y_tolerance = 25
+            current_row = [all_text_items[0]]
+            current_y = all_text_items[0][1]
+            
+            for item in all_text_items[1:]:
+                x, y, text, bbox = item
+                if abs(y - current_y) < y_tolerance:
+                    current_row.append(item)
+                else:
+                    current_row.sort(key=lambda r: r[0])
+                    avg_y = sum(r[1] for r in current_row) / len(current_row)
+                    table_rows.append([r[2] for r in current_row])
+                    table_rows_with_y.append((avg_y, [r[2] for r in current_row]))
+                    current_row = [item]
+                    current_y = y
+            
+            if current_row:
+                current_row.sort(key=lambda r: r[0])
+                avg_y = sum(r[1] for r in current_row) / len(current_row)
+                table_rows.append([r[2] for r in current_row])
+                table_rows_with_y.append((avg_y, [r[2] for r in current_row]))
+    
+    if table_rows:
+        tables.append({"page": page_num, "table": table_rows, "method": "opencv+easyocr"})
+        append_to_chat("system", f"   ✓ Organized into {len(table_rows)} rows")
+    
+    # Build extracted text
+    extracted_text = "\n".join([" | ".join(row) for row in table_rows])
+    
+    # ===== DEBUG: Show detected rows =====
+    if table_rows:
+        append_to_chat("system", "\n📊 TABLE ROWS DETECTED (first 10):")
+        for i, row in enumerate(table_rows[:10]):
+            row_preview = " | ".join(str(c) for c in row[:8])
+            append_to_chat("system", f"  Row {i+1}: {row_preview}")
+        if len(table_rows) > 10:
+            append_to_chat("system", f"  ... and {len(table_rows) - 10} more rows")
     
     # ===== CHECKBOX DETECTION (critical for FT/PT and Y/N) =====
     checkbox_info = ""
     checkboxes = []
-    if _CHECKBOX_DETECTION_AVAILABLE:
-        try:
-            from Tabs.MvrRunner.checkbox_detection import detect_checkboxes_in_image
-            append_to_chat("system", "☑️ Running checkbox detection for FT/PT and Y/N fields...")
-            update_status("Detecting checkboxes on employee table...")
+    try:
+        import cv2
+        import numpy as np
+        
+        append_to_chat("system", "☑️ Running checkbox detection for FT/PT and Y/N fields...")
+        update_status("Detecting checkboxes on employee table...")
+        
+        # Convert PIL image to OpenCV format
+        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+        
+        # Binary threshold
+        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+        
+        # Find contours
+        contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Checkbox detection parameters (image is 3x zoom now)
+        min_size = 25  # Minimum checkbox size (larger for 3x zoom)
+        max_size = 100  # Maximum checkbox size
+        
+        for cnt in contours:
+            x, y, box_w, box_h = cv2.boundingRect(cnt)
             
-            checkbox_results = detect_checkboxes_in_image(img)
+            # Filter by size
+            if not (min_size < box_w < max_size and min_size < box_h < max_size):
+                continue
             
-            if checkbox_results:
-                checked = [cb for cb in checkbox_results if cb.get('checked', False)]
-                unchecked = [cb for cb in checkbox_results if not cb.get('checked', False)]
-                append_to_chat("system", f"✓ Found {len(checked)} checked, {len(unchecked)} unchecked checkboxes")
-                checkboxes = checkbox_results
+            # Filter by aspect ratio (checkboxes are roughly square)
+            aspect_ratio = box_w / float(box_h)
+            if not (0.7 < aspect_ratio < 1.4):
+                continue
+            
+            # Check fill ratio to determine if checked
+            roi = gray[y:y+box_h, x:x+box_w]
+            if roi.size == 0:
+                continue
+            
+            margin = max(2, int(box_w * 0.15))
+            inner = roi[margin:-margin, margin:-margin] if margin * 2 < min(box_w, box_h) else roi
+            
+            if inner.size == 0:
+                continue
+            
+            dark_pixels = np.sum(inner < 128)
+            fill_ratio = dark_pixels / inner.size
+            
+            # Determine if checked (X marks have ~5-15% fill, filled ~20%+)
+            is_checked = fill_ratio > 0.04
+            
+            checkboxes.append({
+                'x': x, 'y': y, 'width': box_w, 'height': box_h,
+                'checked': is_checked, 'fill_ratio': round(fill_ratio, 3)
+            })
+        
+        # Sort by position
+        checkboxes.sort(key=lambda c: (c['y'] // 30, c['x']))
+        
+        if checkboxes:
+            checked_list = [c for c in checkboxes if c['checked']]
+            unchecked_list = [c for c in checkboxes if not c['checked']]
+            append_to_chat("system", f"✓ Found {len(checkboxes)} checkboxes: {len(checked_list)} checked, {len(unchecked_list)} unchecked")
+            
+            # DEBUG: Show checkbox details
+            append_to_chat("system", "\n☑️ CHECKBOX DETAILS (first 10):")
+            for i, cb in enumerate(checkboxes[:10]):
+                status = "☑ CHECKED" if cb['checked'] else "☐ empty"
+                append_to_chat("system", f"  #{i+1}: Y={cb['y']}, X={cb['x']}, fill={cb['fill_ratio']:.1%} → {status}")
+            
+            # Group checkboxes by row (Y position) and identify FT/PT + Y/N columns
+            # Typically: FT and PT are adjacent, then Y and N are adjacent
+            img_width = img.size[0]
+            
+            # Group by row
+            rows_of_checkboxes = {}
+            y_tolerance = 25
+            for cb in checkboxes:
+                row_key = cb['y'] // y_tolerance
+                if row_key not in rows_of_checkboxes:
+                    rows_of_checkboxes[row_key] = []
+                rows_of_checkboxes[row_key].append(cb)
+            
+            # Create human-readable checkbox mapping
+            checkbox_lines = []
+            checkbox_lines.append("FORMAT: Row Y-position | FT/PT Status | Personal Use (Y/N)")
+            checkbox_lines.append("-" * 50)
+            
+            for row_key in sorted(rows_of_checkboxes.keys()):
+                row_cbs = sorted(rows_of_checkboxes[row_key], key=lambda c: c['x'])
                 
-                checkbox_lines = []
-                for cb in checkbox_results:
-                    status = "☑" if cb.get('checked', False) else "☐"
-                    label = cb.get('label', cb.get('text', 'unknown'))
-                    checkbox_lines.append(f"{status} {label}")
-                
-                if checkbox_lines:
-                    checkbox_info = "\n=== CHECKBOX STATUS ===\n" + "\n".join(checkbox_lines)
+                # Typical pattern: 4 checkboxes per row (FT, PT, Y, N)
+                if len(row_cbs) >= 4:
+                    ft_checked = row_cbs[0]['checked']
+                    pt_checked = row_cbs[1]['checked']
+                    y_checked = row_cbs[2]['checked']
+                    n_checked = row_cbs[3]['checked']
                     
-        except Exception as e:
-            append_to_chat("system", f"Checkbox detection error: {str(e)}")
+                    status = "Full-Time" if ft_checked else ("Part-Time" if pt_checked else "Unknown")
+                    personal_use = "Yes" if y_checked else ("No" if n_checked else "Unknown")
+                    
+                    checkbox_lines.append(f"Row ~{row_key * y_tolerance}: Status={status}, Personal Use={personal_use}")
+                elif len(row_cbs) == 2:
+                    # Might be just FT/PT or just Y/N
+                    cb1_checked = row_cbs[0]['checked']
+                    cb2_checked = row_cbs[1]['checked']
+                    checkbox_lines.append(f"Row ~{row_key * y_tolerance}: Checkbox1={'☑' if cb1_checked else '☐'}, Checkbox2={'☑' if cb2_checked else '☐'}")
+            
+            checkbox_info = "\n=== CHECKBOX STATUS (FT/PT and Personal Use) ===\n" + "\n".join(checkbox_lines)
+        else:
+            append_to_chat("system", "⚠ No checkboxes detected")
+                
+    except Exception as e:
+        append_to_chat("system", f"Checkbox detection error: {str(e)}")
     
-    # ===== BUILD CONTEXT =====
-    context_parts = [f"=== DEALER APPLICATION - PAGE {page_num} (Employee Tables) ==="]
+    # ===== MATCH CHECKBOXES TO EMPLOYEE ROWS BY Y-POSITION =====
+    # Create a lookup: checkbox_row_y -> {status, personal_use}
+    checkbox_by_row = {}
+    checkbox_status_map = {}  # Initialize outside to avoid NameError
+    if checkboxes:
+        y_tolerance = 25
+        for cb in checkboxes:
+            row_key = cb['y'] // y_tolerance
+            if row_key not in checkbox_by_row:
+                checkbox_by_row[row_key] = []
+            checkbox_by_row[row_key].append(cb)
+        
+        # Convert to status/personal_use for each row
+        checkbox_status_map = {}  # avg_y -> (status, personal_use)
+        for row_key, row_cbs in checkbox_by_row.items():
+            row_cbs_sorted = sorted(row_cbs, key=lambda c: c['x'])
+            avg_y = row_key * y_tolerance + y_tolerance // 2
+            
+            if len(row_cbs_sorted) >= 4:
+                ft = row_cbs_sorted[0]['checked']
+                pt = row_cbs_sorted[1]['checked']
+                y_use = row_cbs_sorted[2]['checked']
+                n_use = row_cbs_sorted[3]['checked']
+                status = "FT" if ft else ("PT" if pt else "?")
+                personal = "Y" if y_use else ("N" if n_use else "?")
+                checkbox_status_map[avg_y] = (status, personal)
+            elif len(row_cbs_sorted) >= 2:
+                cb1 = row_cbs_sorted[0]['checked']
+                cb2 = row_cbs_sorted[1]['checked']
+                checkbox_status_map[avg_y] = ("☑" if cb1 else "☐", "☑" if cb2 else "☐")
     
-    if tables:
-        for tbl in tables:
-            context_parts.append("\n--- Employee Table ---")
-            for row_idx, row in enumerate(tbl["table"]):
-                if row_idx == 0:
-                    context_parts.append("HEADERS: " + " | ".join(row))
-                else:
-                    context_parts.append(f"Row {row_idx}: " + " | ".join(row))
+    # ===== BUILD EMPLOYEE TABLE WITH CHECKBOX VALUES =====
+    import re
+    context_parts = [f"=== DEALER APPLICATION - PAGE {page_num} ==="]
     
-    if extracted_text:
-        context_parts.append(f"\n--- Raw OCR Text ---")
-        context_parts.append(extracted_text)
+    business_employees = []
+    non_business_employees = []
+    current_section = None
     
-    if checkbox_info:
-        context_parts.append(checkbox_info)
+    # Process table_rows_with_y to match checkboxes
+    for row_y, row_texts in table_rows_with_y:
+        row_text_upper = " ".join(row_texts).upper()
+        
+        # Detect section headers
+        if "BUSINESS PERSONNEL" in row_text_upper and "NON" not in row_text_upper:
+            current_section = "business"
+            continue
+        elif "NON-BUSINESS" in row_text_upper or "NON BUSINESS" in row_text_upper:
+            current_section = "non_business"
+            continue
+        
+        # SKIP: Headers, instructions, questions
+        skip_patterns = [
+            "LIST ALL", "LICENSE #", "STATE", "DOB", "POSITION", "STATUS",
+            "TRANSPORTATION", "CONVICTED", "ALLOW", "BUYERS", "WHOLESALERS",
+            "DEALER PLATES", "PERSONAL USE", "VEHICLES", "INELIGIBLE", "COVERAGE",
+            "EXCLUDED", "POLICY", "COMMERCIAL", "TRANSPORTER", "MISCELLANEOUS",
+            "DRIVING VIOLATIONS", "DUI", "RECKLESS", "DO YOU", "HAVE ANY",
+            "IS PERFORMED", "AT NIGHT", "HOME", "INVENTORY", "RELATIONSHIP", "EXCL"
+        ]
+        if any(p in row_text_upper for p in skip_patterns):
+            continue
+        
+        # SKIP: Too short or too long
+        if len(row_texts) < 3 or len(row_texts) > 12:
+            continue
+        
+        # CHECK: First item looks like a name
+        first = row_texts[0].strip()
+        if len(first) < 2 or not any(c.isalpha() for c in first):
+            continue
+        
+        # CHECK: Has date, license, or state pattern
+        row_joined = " ".join(row_texts)
+        has_date = bool(re.search(r'\d{1,2}/\d{1,2}/\d{2,4}', row_joined))
+        has_license = bool(re.search(r'[A-Z0-9]{5,}', row_joined, re.IGNORECASE))
+        has_state = bool(re.search(r'\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b', row_joined))
+        
+        if not (has_date or has_license or has_state):
+            continue
+        
+        # MATCH CHECKBOXES by finding closest Y position
+        status_val = "?"
+        personal_val = "?"
+        if checkbox_status_map:
+            closest_cb_y = min(checkbox_status_map.keys(), key=lambda cy: abs(cy - row_y))
+            if abs(closest_cb_y - row_y) < 50:  # Within 50 pixels
+                status_val, personal_val = checkbox_status_map[closest_cb_y]
+        
+        # Build employee record - clean up OCR artifacts
+        clean_row = [t for t in row_texts if t.upper() not in ["FT", "PT", "Y", "N", "JN", "XN", "DN", "BN"]]
+        
+        # Parse fields: NAME | LICENSE # | STATE | DOB | POSITION
+        name = clean_row[0] if len(clean_row) > 0 else "?"
+        license_num = clean_row[1] if len(clean_row) > 1 else "?"
+        state = clean_row[2] if len(clean_row) > 2 else "?"
+        dob = clean_row[3] if len(clean_row) > 3 else "?"
+        position = clean_row[4] if len(clean_row) > 4 else "?"
+        
+        employee = {
+            "name": name,
+            "license": license_num,
+            "state": state,
+            "dob": dob,
+            "position": position,
+            "status": status_val,
+            "personal_use": personal_val
+        }
+        
+        if current_section == "business":
+            business_employees.append(employee)
+        elif current_section == "non_business":
+            non_business_employees.append(employee)
+        else:
+            business_employees.append(employee)
+    
+    # ===== DISPLAY EMPLOYEE TABLE DIRECTLY IN CHAT =====
+    append_to_chat("system", "\n" + "="*70)
+    append_to_chat("system", "📋 EXTRACTED EMPLOYEE DATA")
+    append_to_chat("system", "="*70)
+    
+    if business_employees:
+        append_to_chat("system", "\n👔 BUSINESS PERSONNEL:")
+        append_to_chat("system", "-" * 70)
+        append_to_chat("system", f"{'NAME':<25} {'LICENSE':<12} {'ST':<4} {'DOB':<12} {'POS':<10} {'ST':<4} {'USE':<4}")
+        append_to_chat("system", "-" * 70)
+        for emp in business_employees:
+            line = f"{emp['name']:<25} {emp['license']:<12} {emp['state']:<4} {emp['dob']:<12} {emp['position']:<10} {emp['status']:<4} {emp['personal_use']:<4}"
+            append_to_chat("system", line)
+        context_parts.append("\n=== BUSINESS PERSONNEL ===")
+        for i, emp in enumerate(business_employees):
+            context_parts.append(f"Employee {i+1}: {emp['name']} | {emp['license']} | {emp['state']} | {emp['dob']} | {emp['position']} | Status: {emp['status']} | Personal Use: {emp['personal_use']}")
+    
+    if non_business_employees:
+        append_to_chat("system", "\n👨‍👩‍👧 NON-BUSINESS PERSONNEL:")
+        append_to_chat("system", "-" * 70)
+        append_to_chat("system", f"{'NAME':<25} {'LICENSE':<12} {'ST':<4} {'DOB':<12} {'REL':<10} {'USE':<4} {'EXCL':<4}")
+        append_to_chat("system", "-" * 70)
+        for emp in non_business_employees:
+            line = f"{emp['name']:<25} {emp['license']:<12} {emp['state']:<4} {emp['dob']:<12} {emp['position']:<10} {emp['status']:<4} {emp['personal_use']:<4}"
+            append_to_chat("system", line)
+        context_parts.append("\n=== NON-BUSINESS PERSONNEL ===")
+        for i, emp in enumerate(non_business_employees):
+            context_parts.append(f"Person {i+1}: {emp['name']} | {emp['license']} | {emp['state']} | {emp['dob']} | {emp['position']} | Personal Use: {emp['status']} | Excl: {emp['personal_use']}")
+    
+    if not business_employees and not non_business_employees:
+        append_to_chat("system", "⚠️ No valid employee rows detected.")
+        context_parts.append("No employee data found.")
+    else:
+        total = len(business_employees) + len(non_business_employees)
+        append_to_chat("system", f"\n✅ Total: {len(business_employees)} business + {len(non_business_employees)} non-business = {total} people")
+    
+    append_to_chat("system", "="*70)
     
     result['text'] = extracted_text or ''
     result['tables'] = tables
     result['checkboxes'] = checkboxes
     result['context'] = "\n".join(context_parts)
+    # Store extracted employees for direct MVR export
+    result['employees'] = business_employees + non_business_employees
+    result['business_employees'] = business_employees
+    result['non_business_employees'] = non_business_employees
     
     return result
 
@@ -1448,6 +1784,8 @@ def build_tab(parent):
     document_context: List[str] = []
     # Track loaded PDF paths for checkbox detection
     loaded_pdf_paths: List[str] = []
+    # Store extracted employees for direct MVR export (no AI needed!)
+    extracted_employees: List[Dict] = []
     
     def update_status(text):
         """Update status label"""
@@ -1493,17 +1831,91 @@ def build_tab(parent):
         chat_thread = None
     
     def extract_mvr_with_ai():
-        """Use AI to extract MVR fields from document context and import to MVR Runner"""
-        nonlocal ollama_connected, chat_thread
+        """Extract MVR fields and import to MVR Runner - uses direct extraction when available"""
+        nonlocal ollama_connected, chat_thread, extracted_employees
         
-        if not document_context:
+        if not document_context and not extracted_employees:
             messagebox.showwarning("No Document", "Please upload a document first to extract MVR information.")
             return
         
+        # ===== FAST PATH: Use direct extraction if we have employee data =====
+        if extracted_employees:
+            append_to_chat("system", f"\n🚀 DIRECT MVR EXPORT (no AI needed)")
+            append_to_chat("system", f"   Found {len(extracted_employees)} employees ready for export")
+            
+            def direct_import():
+                try:
+                    # Try to import MvrRunner callback
+                    callback = None
+                    try:
+                        from Tabs import MvrRunner
+                        callback = getattr(MvrRunner, '_add_mvr_entry_callback', None)
+                    except (ImportError, AttributeError):
+                        import importlib
+                        mvr_module = importlib.import_module('Tabs.MvrRunner')
+                        callback = getattr(mvr_module, '_add_mvr_entry_callback', None)
+                    
+                    if not callback:
+                        append_to_chat("system", "⚠️ MVR Runner callback not available. Displaying data instead:")
+                        for i, emp in enumerate(extracted_employees, 1):
+                            append_to_chat("system", f"\n  {i}. {emp.get('name', '?')}")
+                            append_to_chat("system", f"     License: {emp.get('license', '?')}, State: {emp.get('state', '?')}")
+                            append_to_chat("system", f"     DOB: {emp.get('dob', '?')}, Status: {emp.get('status', '?')}")
+                        return
+                    
+                    imported = 0
+                    skipped = 0
+                    
+                    for emp in extracted_employees:
+                        # Convert employee dict to MVR format
+                        name_parts = emp.get('name', '').strip().split()
+                        first_name = name_parts[0] if name_parts else ''
+                        last_name = ' '.join(name_parts[1:]) if len(name_parts) > 1 else ''
+                        
+                        mvr_data = {
+                            'first_name': first_name,
+                            'last_name': last_name,
+                            'license_number': emp.get('license', ''),
+                            'state': emp.get('state', ''),
+                            'dob': emp.get('dob', ''),
+                            'status': emp.get('status', ''),
+                            'personal_use': emp.get('personal_use', ''),
+                            'extracted_text': f"Direct extraction from dealer application\nName: {emp.get('name')}\nLicense: {emp.get('license')}\nState: {emp.get('state')}\nDOB: {emp.get('dob')}\nStatus: {emp.get('status')}\nPersonal Use: {emp.get('personal_use')}"
+                        }
+                        
+                        try:
+                            import copy
+                            success, message = callback(copy.deepcopy(mvr_data), source="Direct OCR")
+                            if success:
+                                imported += 1
+                                append_to_chat("system", f"   ✓ Imported: {first_name} {last_name}")
+                            else:
+                                skipped += 1
+                                append_to_chat("system", f"   ⚠ Skipped: {first_name} {last_name} - {message}")
+                        except Exception as e:
+                            skipped += 1
+                            append_to_chat("system", f"   ✗ Error: {first_name} {last_name} - {str(e)}")
+                    
+                    if imported > 0:
+                        append_to_chat("system", f"\n✅ Successfully imported {imported}/{len(extracted_employees)} employees to MVR Runner")
+                        update_status(f"Imported {imported} employees to MVR Runner")
+                    else:
+                        append_to_chat("system", f"\n⚠️ No employees imported ({skipped} skipped)")
+                        update_status("No employees imported")
+                        
+                except Exception as e:
+                    append_to_chat("system", f"Error during direct import: {str(e)}")
+                    update_status("Import error")
+            
+            # Run import in UI thread
+            outer.after(0, direct_import)
+            return
+        
+        # ===== FALLBACK: Use AI extraction (slower) =====
         if not ollama_connected:
             messagebox.showwarning(
                 "Ollama Not Connected",
-                "Cannot connect to Ollama. Make sure Ollama is running."
+                "No direct employee data available and Ollama is not connected."
             )
             return
         
@@ -1513,7 +1925,8 @@ def build_tab(parent):
         
         def extract_worker():
             try:
-                update_status("Extracting MVR fields with AI...")
+                update_status("Extracting MVR fields with AI (slower method)...")
+                append_to_chat("system", "⚠️ No direct employee data - using AI extraction (slower)")
                 
                 # Combine all document context
                 combined_text = "\n\n".join(document_context)
@@ -2292,32 +2705,31 @@ Do NOT skip the state field if you see ANY text in the STATE column.
         # Clear input
         input_text.delete("1.0", "end")
         
-        # Add document context if available - LIMIT SIZE to prevent timeout
+        # Add document context ONLY if this is first question about the document
         full_message = user_input
-        if document_context:
-            # Combine document context but limit total size to 8000 chars
-            max_context_chars = 8000
+        context_already_sent = any("Document Content" in msg.get("content", "") for msg in conversation_history)
+        
+        if document_context and not context_already_sent:
+            # Combine document context - limit to 4000 chars for speed
+            max_context_chars = 4000
             combined_context = ""
-            for ctx in document_context[-2:]:  # Last 2 documents max
-                if len(combined_context) + len(ctx) < max_context_chars:
-                    combined_context += f"\n\n--- Document Content ---\n{ctx}"
+            for ctx in document_context[-1:]:  # Only last document
+                if len(ctx) < max_context_chars:
+                    combined_context = ctx
                 else:
-                    # Truncate if too long
-                    remaining = max_context_chars - len(combined_context)
-                    if remaining > 500:
-                        combined_context += f"\n\n--- Document Content (truncated) ---\n{ctx[:remaining]}..."
-                    break
+                    combined_context = ctx[:max_context_chars] + "..."
+                break
             
             if combined_context:
-                full_message = f"{combined_context}\n\n--- User Question ---\n{user_input}"
+                full_message = f"--- Document Content ---\n{combined_context}\n\n--- Question ---\n{user_input}"
                 append_to_chat("system", f"📄 Context: {len(combined_context)} chars sent to AI")
         
         # Add to conversation
         append_to_chat("user", user_input)
         conversation_history.append({"role": "user", "content": full_message})
         
-        # Prepare messages for API (keep last 10 messages for context - reduced from 20)
-        api_messages = conversation_history[-10:]
+        # Prepare messages for API (keep last 4 messages only for speed)
+        api_messages = conversation_history[-4:]
         
         # Update status with model info
         update_status(f"Thinking... (using {settings.get('model', 'default')})")
@@ -2332,11 +2744,12 @@ Do NOT skip the state field if you see ANY text in the STATE column.
     
     def clear_conversation():
         """Clear conversation history"""
-        nonlocal conversation_history, document_context, loaded_pdf_paths
+        nonlocal conversation_history, document_context, loaded_pdf_paths, extracted_employees
         
         conversation_history.clear()
         document_context.clear()
         loaded_pdf_paths.clear()
+        extracted_employees.clear()
         chat_display.config(state="normal")
         chat_display.delete("1.0", "end")
         append_to_chat("system", "Conversation cleared.")
@@ -2392,9 +2805,23 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                 
                 # ===== DEALER APPLICATION SPECIAL HANDLING =====
                 # Process page 2 (employee tables) as an IMAGE, like a pasted screenshot
+                if pdf_info:
+                    append_to_chat("system", f"📄 PDF Analysis:")
+                    append_to_chat("system", f"   • is_text_based: {pdf_info.get('is_text_based')}")
+                    append_to_chat("system", f"   • is_dealer_app: {pdf_info.get('is_dealer_app')}")
+                    append_to_chat("system", f"   • has_employee_tables: {pdf_info.get('has_employee_tables')}")
+                    append_to_chat("system", f"   • employee_table_pages: {pdf_info.get('employee_table_pages')}")
+                    
+                    # Show why it might not be detected
+                    text_preview = pdf_info.get('text_layer', '')[:200]
+                    if text_preview:
+                        append_to_chat("system", f"   • Text preview: {text_preview[:100]}...")
+                    else:
+                        append_to_chat("system", f"   ⚠️ No text layer found - this is a scanned PDF")
+                
                 if pdf_info and pdf_info.get("is_dealer_app") and pdf_info.get("has_employee_tables"):
-                    append_to_chat("system", "📋 DEALER APPLICATION detected!")
-                    append_to_chat("system", f"   Employee table pages: {[p+1 for p in pdf_info['employee_table_pages']]}")
+                    append_to_chat("system", "\n📋 DEALER APPLICATION detected!")
+                    append_to_chat("system", f"   Processing page(s): {[p+1 for p in pdf_info['employee_table_pages']]}")
                     
                     all_context = []
                     
@@ -2406,11 +2833,20 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                         # Extract page as image (like a pasted screenshot)
                         page_img = _extract_page_as_image(file_path, page_num)
                         if page_img:
+                            append_to_chat("system", f"   ✓ Image extracted: {page_img.size[0]}x{page_img.size[1]} pixels")
+                            
                             # Process using same approach as clipboard paste
                             result = _process_dealer_app_image(page_img, page_num + 1, append_to_chat, update_status)
                             
+                            # Store the context
                             if result['context']:
                                 all_context.append(result['context'])
+                                
+                                # Store extracted employees for direct MVR export (no AI needed!)
+                                if result.get('employees'):
+                                    extracted_employees.clear()
+                                    extracted_employees.extend(result['employees'])
+                                    append_to_chat("system", f"   💾 {len(result['employees'])} employees stored for MVR export")
                                 
                                 # Show summary
                                 append_to_chat("system", f"\n✅ Page {page_num + 1} processed!")
@@ -2419,6 +2855,8 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                                 if result['checkboxes']:
                                     checked = len([c for c in result['checkboxes'] if c.get('checked')])
                                     append_to_chat("system", f"   • {len(result['checkboxes'])} checkboxes ({checked} checked)")
+                        else:
+                            append_to_chat("system", f"   ❌ Failed to extract page {page_num + 1} as image!")
                     
                     # Store combined context
                     if all_context:
@@ -2434,9 +2872,31 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                             outer._doc_context_display.insert('1.0', display_text)
                             outer._doc_context_display.configure(state='disabled')
                         
-                        append_to_chat("system", "\n💡 You can now ask: 'List all employees and their info'")
+                        # === DIRECT DISPLAY: Show extracted data WITHOUT AI ===
+                        append_to_chat("system", "\n" + "="*50)
+                        append_to_chat("system", "📋 EXTRACTED EMPLOYEE DATA (No AI needed)")
+                        append_to_chat("system", "="*50)
+                        
+                        # Display the structured data directly
+                        for ctx in all_context:
+                            # Show each line of context
+                            for line in ctx.split('\n'):
+                                if line.strip() and not line.startswith('---'):
+                                    if 'Employee' in line or 'Person' in line:
+                                        append_to_chat("system", f"👤 {line}")
+                                    elif 'BUSINESS PERSONNEL' in line or 'NON-BUSINESS' in line:
+                                        append_to_chat("system", f"\n📁 {line}")
+                                    elif 'Row' in line and ':' in line:
+                                        append_to_chat("system", f"   {line}")
+                                    elif 'Status=' in line or 'Checkbox' in line:
+                                        append_to_chat("system", f"   {line}")
+                        
+                        append_to_chat("system", "\n" + "="*50)
+                        append_to_chat("system", "⬆️ EMPLOYEE DATA IS SHOWN ABOVE ⬆️")
+                        append_to_chat("system", "❌ DO NOT ask AI to 'list employees' - data is already displayed!")
+                        append_to_chat("system", "✅ Just scroll up to see the extracted employee info.")
                     
-                    update_status("Dealer application processed - ready for questions")
+                    update_status("Dealer application processed - data displayed")
                     return
                 
                 # ===== REGULAR DOCUMENT HANDLING =====
