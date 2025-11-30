@@ -1272,24 +1272,31 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
         append_to_chat("system", f"Checkbox detection error: {str(e)}")
     
     # ===== MATCH CHECKBOXES TO EMPLOYEE ROWS BY Y-POSITION =====
-    # Create a lookup: checkbox_row_y -> {status, personal_use}
+    # Only use RIGHTMOST checkboxes (FT/PT/Y/N columns are in right 25% of page)
     checkbox_by_row = {}
     checkbox_status_map = {}  # Initialize outside to avoid NameError
     if checkboxes:
         y_tolerance = 25
-        for cb in checkboxes:
+        img_width = img.size[0]
+        # Only consider checkboxes in the rightmost 25% of the page (FT/PT/Y/N columns)
+        right_threshold = img_width * 0.75  # ~1377 for 1836px wide image
+        
+        rightmost_checkboxes = [cb for cb in checkboxes if cb['x'] > right_threshold]
+        
+        for cb in rightmost_checkboxes:
             row_key = cb['y'] // y_tolerance
             if row_key not in checkbox_by_row:
                 checkbox_by_row[row_key] = []
             checkbox_by_row[row_key].append(cb)
         
         # Convert to status/personal_use for each row
-        checkbox_status_map = {}  # avg_y -> (status, personal_use)
+        # Expect 4 checkboxes per row: FT, PT, Y, N (sorted by X position)
         for row_key, row_cbs in checkbox_by_row.items():
             row_cbs_sorted = sorted(row_cbs, key=lambda c: c['x'])
             avg_y = row_key * y_tolerance + y_tolerance // 2
             
             if len(row_cbs_sorted) >= 4:
+                # Standard layout: FT, PT, Y, N
                 ft = row_cbs_sorted[0]['checked']
                 pt = row_cbs_sorted[1]['checked']
                 y_use = row_cbs_sorted[2]['checked']
@@ -1297,10 +1304,12 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
                 status = "FT" if ft else ("PT" if pt else "?")
                 personal = "Y" if y_use else ("N" if n_use else "?")
                 checkbox_status_map[avg_y] = (status, personal)
-            elif len(row_cbs_sorted) >= 2:
-                cb1 = row_cbs_sorted[0]['checked']
-                cb2 = row_cbs_sorted[1]['checked']
-                checkbox_status_map[avg_y] = ("☑" if cb1 else "☐", "☑" if cb2 else "☐")
+            elif len(row_cbs_sorted) == 2:
+                # Non-business section might only have Y/N (personal use, excl)
+                y_val = row_cbs_sorted[0]['checked']
+                n_val = row_cbs_sorted[1]['checked']
+                personal = "Y" if y_val else ("N" if n_val else "?")
+                checkbox_status_map[avg_y] = ("?", personal)  # No FT/PT for non-business
     
     # ===== BUILD EMPLOYEE TABLE WITH CHECKBOX VALUES =====
     import re
@@ -1329,7 +1338,8 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
             "DEALER PLATES", "PERSONAL USE", "VEHICLES", "INELIGIBLE", "COVERAGE",
             "EXCLUDED", "POLICY", "COMMERCIAL", "TRANSPORTER", "MISCELLANEOUS",
             "DRIVING VIOLATIONS", "DUI", "RECKLESS", "DO YOU", "HAVE ANY",
-            "IS PERFORMED", "AT NIGHT", "HOME", "INVENTORY", "RELATIONSHIP", "EXCL"
+            "IS PERFORMED", "AT NIGHT", "HOME", "INVENTORY", "RELATIONSHIP", "EXCL",
+            "ANYONE UNDER", "AGE OF", "BETWEEN"
         ]
         if any(p in row_text_upper for p in skip_patterns):
             continue
@@ -1338,18 +1348,38 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
         if len(row_texts) < 3 or len(row_texts) > 12:
             continue
         
-        # CHECK: First item looks like a name
+        # CHECK: First item looks like a REAL name (not OCR garbage)
         first = row_texts[0].strip()
-        if len(first) < 2 or not any(c.isalpha() for c in first):
+        
+        # Name must be at least 4 chars (e.g. "John") or contain a space (e.g. "Jo B")
+        if len(first) < 4 and ' ' not in first:
             continue
         
-        # CHECK: Has date, license, or state pattern
+        # Skip common OCR artifacts that look like short words
+        garbage_names = ["IN", "UY", "DY", "JN", "XN", "DN", "BN", "FT", "PT", "IPT", "EFT", "IFT"]
+        if first.upper() in garbage_names:
+            continue
+        
+        # Name should not be just letters/numbers that look like checkbox OCR
+        if re.match(r'^[IFTPYN]{1,3}$', first.upper()):
+            continue
+        
+        # CHECK: Has date pattern (most reliable indicator of employee row)
         row_joined = " ".join(row_texts)
         has_date = bool(re.search(r'\d{1,2}/\d{1,2}/\d{2,4}', row_joined))
-        has_license = bool(re.search(r'[A-Z0-9]{5,}', row_joined, re.IGNORECASE))
-        has_state = bool(re.search(r'\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b', row_joined))
         
-        if not (has_date or has_license or has_state):
+        # License must be 6+ alphanumeric chars (not short codes)
+        has_license = bool(re.search(r'[A-Z0-9]{6,}', row_joined, re.IGNORECASE))
+        
+        # State code must be in a position that makes sense (not just anywhere)
+        has_state = bool(re.search(r'\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b', row_joined))
+        
+        # REQUIRE: Must have a date (DOB) - this is the strongest indicator
+        if not has_date:
+            continue
+        
+        # Also need at least license OR state
+        if not (has_license or has_state):
             continue
         
         # MATCH CHECKBOXES by finding closest Y position
@@ -1361,13 +1391,31 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
                 status_val, personal_val = checkbox_status_map[closest_cb_y]
         
         # Build employee record - clean up OCR artifacts
-        clean_row = [t for t in row_texts if t.upper() not in ["FT", "PT", "Y", "N", "JN", "XN", "DN", "BN"]]
+        clean_row = [t for t in row_texts if t.upper() not in ["FT", "PT", "Y", "N", "JN", "XN", "DN", "BN", "EFT", "IFT", "IPT", "IN"]]
+        
+        # Helper to format DOB as MM/DD/YYYY with leading zeros
+        def format_dob(dob_str):
+            if not dob_str or dob_str == "?":
+                return "?"
+            # Match date pattern M/D/YYYY or MM/DD/YYYY
+            match = re.match(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})', dob_str)
+            if match:
+                month, day, year = match.groups()
+                # Pad with leading zeros
+                month = month.zfill(2)
+                day = day.zfill(2)
+                # Handle 2-digit years
+                if len(year) == 2:
+                    year = "19" + year if int(year) > 50 else "20" + year
+                return f"{month}/{day}/{year}"
+            return dob_str
         
         # Parse fields: NAME | LICENSE # | STATE | DOB | POSITION
         name = clean_row[0] if len(clean_row) > 0 else "?"
         license_num = clean_row[1] if len(clean_row) > 1 else "?"
         state = clean_row[2] if len(clean_row) > 2 else "?"
-        dob = clean_row[3] if len(clean_row) > 3 else "?"
+        dob_raw = clean_row[3] if len(clean_row) > 3 else "?"
+        dob = format_dob(dob_raw)
         position = clean_row[4] if len(clean_row) > 4 else "?"
         
         employee = {
@@ -1868,9 +1916,10 @@ def build_tab(parent):
                     
                     for emp in extracted_employees:
                         # Convert employee dict to MVR format
+                        # First name = first word, Last name = LAST word only (not middle names)
                         name_parts = emp.get('name', '').strip().split()
                         first_name = name_parts[0] if name_parts else ''
-                        last_name = ' '.join(name_parts[1:]) if len(name_parts) > 1 else ''
+                        last_name = name_parts[-1] if len(name_parts) > 1 else ''  # Only the LAST word
                         
                         mvr_data = {
                             'first_name': first_name,
@@ -2939,6 +2988,43 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                     extracted_text = extract_text_from_document(file_path, ocr_engine)
                 
                 if extracted_text and not extracted_text.startswith("Error") and not extracted_text.startswith("Tesseract OCR error") and not extracted_text.startswith("EasyOCR error") and not extracted_text.startswith("Ollama vision error"):
+                    
+                    # ===== CHECK IF SCANNED PDF IS A DEALER APP =====
+                    # If OCR text contains dealer app cues, run specialized processing on page 2
+                    import re
+                    is_scanned_dealer_app = False
+                    for pattern in _DEALER_APP_CUES:
+                        if re.search(pattern, extracted_text):
+                            is_scanned_dealer_app = True
+                            break
+                    
+                    if is_scanned_dealer_app and file_path.lower().endswith('.pdf'):
+                        append_to_chat("system", "\n📋 SCANNED DEALER APPLICATION detected!")
+                        append_to_chat("system", "   Re-processing page 2 with specialized table extraction...")
+                        
+                        # Process page 2 with the dealer app method
+                        page_img = _extract_page_as_image(file_path, 1)  # Page 2 = index 1
+                        if page_img:
+                            append_to_chat("system", f"   ✓ Page 2 image: {page_img.size[0]}x{page_img.size[1]} pixels")
+                            
+                            result = _process_dealer_app_image(page_img, 2, append_to_chat, update_status)
+                            
+                            if result.get('employees'):
+                                extracted_employees.clear()
+                                extracted_employees.extend(result['employees'])
+                                append_to_chat("system", f"   💾 {len(result['employees'])} employees stored for MVR export")
+                            
+                            if result.get('context'):
+                                document_context.append(result['context'])
+                                loaded_pdf_paths.append(file_path)
+                                
+                                append_to_chat("system", f"\n✅ Dealer application processed!")
+                                append_to_chat("system", f"   💡 Click 'Extract MVR → MVR Runner' to export employees")
+                                update_status("Dealer application processed - ready for MVR export")
+                                return
+                        else:
+                            append_to_chat("system", "   ⚠️ Could not extract page 2 image, using generic OCR")
+                    
                     # Clean OCR text and store in document context (don't display in input)
                     cleaned_text = _clean_ocr_text(extracted_text)
                     document_context.append(cleaned_text)
