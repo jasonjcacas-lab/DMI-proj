@@ -1291,9 +1291,11 @@ def build_tab(parent):
             "extracted_text": mvr_data.get("extracted_text", "")
         }
         
-        # Check if all fields are empty
-        if not any(new_data.get(k, "") for k in ["license_number", "last_name", "first_name", "dob", "state"]):
-            return False, "No MVR data provided"
+        # Check if all fields are empty (accept entries with at least a name OR license)
+        has_name = bool(new_data.get("first_name", "").strip() or new_data.get("last_name", "").strip())
+        has_license = bool(new_data.get("license_number", "").strip())
+        if not has_name and not has_license:
+            return False, "No MVR data provided (need at least a name or license)"
         
         # Check for duplicate
         duplicate_id = check_duplicate_mvr_data(new_data)

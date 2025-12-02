@@ -1089,6 +1089,16 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
     
     # Store rows WITH their Y-positions for checkbox matching
     table_rows_with_y = []  # List of (avg_y, [text1, text2, ...])
+    # Also store with X positions for column mapping
+    table_rows_with_xy = []  # List of (avg_y, [(x, text), ...])
+    
+    # Create column boundaries from detected vertical lines
+    col_boundaries = []
+    if col_xs and len(col_xs) > 1:
+        col_xs_sorted = sorted(col_xs)
+        for i in range(len(col_xs_sorted) - 1):
+            col_boundaries.append((col_xs_sorted[i], col_xs_sorted[i + 1]))
+        append_to_chat("system", f"   Using {len(col_boundaries)} column boundaries")
     
     if row_ys and len(row_ys) > 2:
         # Use detected horizontal lines to group rows
@@ -1105,10 +1115,28 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
                         if y_start <= y <= y_end]
             if row_items:
                 row_items.sort(key=lambda item: item[0])  # Sort by X
-                row_texts = [item[2] for item in row_items]
                 avg_y = sum(item[1] for item in row_items) / len(row_items)
+                
+                # If we have column boundaries, map text to columns (detecting blanks)
+                if col_boundaries:
+                    row_by_col = [""] * len(col_boundaries)  # Initialize all columns as blank
+                    for x, y, text, bbox in row_items:
+                        # Find which column this text belongs to
+                        for col_idx, (col_start, col_end) in enumerate(col_boundaries):
+                            if col_start <= x <= col_end:
+                                # Append to existing text in column (in case multiple items per cell)
+                                if row_by_col[col_idx]:
+                                    row_by_col[col_idx] += " " + text
+                                else:
+                                    row_by_col[col_idx] = text
+                                break
+                    row_texts = row_by_col
+                else:
+                    row_texts = [item[2] for item in row_items]
+                
                 table_rows.append(row_texts)
                 table_rows_with_y.append((avg_y, row_texts))
+                table_rows_with_xy.append((avg_y, [(item[0], item[2]) for item in row_items]))
     else:
         # Fallback: Use Y-clustering (like PNG method)
         append_to_chat("system", "   No table lines detected, using Y-clustering")
@@ -1271,15 +1299,50 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
     except Exception as e:
         append_to_chat("system", f"Checkbox detection error: {str(e)}")
     
-    # ===== MATCH CHECKBOXES TO EMPLOYEE ROWS BY Y-POSITION =====
-    # Only use RIGHTMOST checkboxes (FT/PT/Y/N columns are in right 25% of page)
-    checkbox_by_row = {}
-    checkbox_status_map = {}  # Initialize outside to avoid NameError
+    # ===== BUILD EMPLOYEE TABLE WITH CHECKBOX VALUES =====
+    import re
+    context_parts = [f"=== DEALER APPLICATION - PAGE {page_num} ==="]
+    
+    business_employees = []
+    non_business_employees = []
+    current_section = None
+    
+    # First pass: Find the Y-coordinate where NON-BUSINESS section starts
+    non_business_start_y = None
+    append_to_chat("system", "\n🔍 Searching for NON-BUSINESS section header...")
+    for row_y, row_texts in table_rows_with_y:
+        row_text_upper = " ".join(row_texts).upper()
+        # Check for various OCR variations of "NON-BUSINESS"
+        if any(nb in row_text_upper for nb in ["NON-BUSINESS", "NON BUSINESS", "NONBUSINESS", "NON-BUS", "NONBUS"]):
+            non_business_start_y = row_y
+            append_to_chat("system", f"   ✓ Found NON-BUSINESS header at Y={row_y}: {row_text_upper[:60]}...")
+            break
+        # Also check for "SPOUSES" or "FAMILY" which indicates non-business section
+        if "SPOUSES" in row_text_upper or "FAMILY MEMBERS" in row_text_upper or "HOUSEHOLD" in row_text_upper:
+            non_business_start_y = row_y
+            append_to_chat("system", f"   ✓ Found family/household header at Y={row_y}: {row_text_upper[:60]}...")
+            break
+    
+    if non_business_start_y is None:
+        append_to_chat("system", "   ⚠️ NON-BUSINESS section header NOT found in OCR text")
+        # Show some rows to help debug
+        append_to_chat("system", "   Sample rows searched:")
+        for i, (row_y, row_texts) in enumerate(table_rows_with_y):
+            if i >= 15:  # Show first 15 rows
+                break
+            row_text = " ".join(row_texts)
+            if len(row_text) > 5:  # Only show non-trivial rows
+                append_to_chat("system", f"     Y={row_y}: {row_text[:80]}...")
+    
+    # Build separate checkbox maps for business vs non-business sections
+    business_checkbox_map = {}  # Maps Y -> (status, personal_use)
+    non_business_checkbox_map = {}  # Maps Y -> (personal_use, excl)
+    
     if checkboxes:
-        y_tolerance = 25
+        y_tolerance = 40
+        checkbox_by_row = {}
         img_width = img.size[0]
-        # Only consider checkboxes in the rightmost 25% of the page (FT/PT/Y/N columns)
-        right_threshold = img_width * 0.75  # ~1377 for 1836px wide image
+        right_threshold = img_width * 0.75
         
         rightmost_checkboxes = [cb for cb in checkboxes if cb['x'] > right_threshold]
         
@@ -1289,46 +1352,55 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
                 checkbox_by_row[row_key] = []
             checkbox_by_row[row_key].append(cb)
         
-        # Convert to status/personal_use for each row
-        # Expect 4 checkboxes per row: FT, PT, Y, N (sorted by X position)
         for row_key, row_cbs in checkbox_by_row.items():
             row_cbs_sorted = sorted(row_cbs, key=lambda c: c['x'])
             avg_y = row_key * y_tolerance + y_tolerance // 2
             
+            # Determine if this row is in business or non-business section
+            is_non_business = non_business_start_y is not None and avg_y > non_business_start_y
+            
             if len(row_cbs_sorted) >= 4:
-                # Standard layout: FT, PT, Y, N
-                ft = row_cbs_sorted[0]['checked']
-                pt = row_cbs_sorted[1]['checked']
-                y_use = row_cbs_sorted[2]['checked']
-                n_use = row_cbs_sorted[3]['checked']
-                status = "FT" if ft else ("PT" if pt else "?")
-                personal = "Y" if y_use else ("N" if n_use else "?")
-                checkbox_status_map[avg_y] = (status, personal)
+                if is_non_business:
+                    # Non-business: Y, N (personal use), Y, N (excl)
+                    y_personal = row_cbs_sorted[0]['checked']
+                    n_personal = row_cbs_sorted[1]['checked']
+                    y_excl = row_cbs_sorted[2]['checked']
+                    n_excl = row_cbs_sorted[3]['checked']
+                    personal = "Y" if y_personal else ("N" if n_personal else "?")
+                    excl = "Y" if y_excl else ("N" if n_excl else "?")
+                    non_business_checkbox_map[avg_y] = (personal, excl)
+                else:
+                    # Business: FT, PT, Y, N
+                    ft = row_cbs_sorted[0]['checked']
+                    pt = row_cbs_sorted[1]['checked']
+                    y_use = row_cbs_sorted[2]['checked']
+                    n_use = row_cbs_sorted[3]['checked']
+                    status = "FT" if ft else ("PT" if pt else "?")
+                    personal = "Y" if y_use else ("N" if n_use else "?")
+                    business_checkbox_map[avg_y] = (status, personal)
             elif len(row_cbs_sorted) == 2:
-                # Non-business section might only have Y/N (personal use, excl)
+                # Only 2 checkboxes - assume Y/N pattern
                 y_val = row_cbs_sorted[0]['checked']
                 n_val = row_cbs_sorted[1]['checked']
-                personal = "Y" if y_val else ("N" if n_val else "?")
-                checkbox_status_map[avg_y] = ("?", personal)  # No FT/PT for non-business
-    
-    # ===== BUILD EMPLOYEE TABLE WITH CHECKBOX VALUES =====
-    import re
-    context_parts = [f"=== DEALER APPLICATION - PAGE {page_num} ==="]
-    
-    business_employees = []
-    non_business_employees = []
-    current_section = None
+                val = "Y" if y_val else ("N" if n_val else "?")
+                if is_non_business:
+                    non_business_checkbox_map[avg_y] = (val, "?")
+                else:
+                    business_checkbox_map[avg_y] = ("?", val)
     
     # Process table_rows_with_y to match checkboxes
+    append_to_chat("system", f"\n📊 Processing {len(table_rows_with_y)} rows for employee data...")
     for row_y, row_texts in table_rows_with_y:
         row_text_upper = " ".join(row_texts).upper()
         
         # Detect section headers
         if "BUSINESS PERSONNEL" in row_text_upper and "NON" not in row_text_upper:
             current_section = "business"
+            append_to_chat("system", f"   📁 Switched to BUSINESS section at Y={row_y}")
             continue
-        elif "NON-BUSINESS" in row_text_upper or "NON BUSINESS" in row_text_upper:
+        elif any(nb in row_text_upper for nb in ["NON-BUSINESS", "NON BUSINESS", "NONBUSINESS", "NON-BUS", "SPOUSES", "FAMILY", "HOUSEHOLD"]):
             current_section = "non_business"
+            append_to_chat("system", f"   📁 Switched to NON-BUSINESS section at Y={row_y}")
             continue
         
         # SKIP: Headers, instructions, questions
@@ -1339,24 +1411,24 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
             "EXCLUDED", "POLICY", "COMMERCIAL", "TRANSPORTER", "MISCELLANEOUS",
             "DRIVING VIOLATIONS", "DUI", "RECKLESS", "DO YOU", "HAVE ANY",
             "IS PERFORMED", "AT NIGHT", "HOME", "INVENTORY", "RELATIONSHIP", "EXCL",
-            "ANYONE UNDER", "AGE OF", "BETWEEN"
+            "ANYONE UNDER", "AGE OF", "BETWEEN", "CHILDREN"
         ]
         if any(p in row_text_upper for p in skip_patterns):
             continue
         
         # SKIP: Too short or too long
-        if len(row_texts) < 3 or len(row_texts) > 12:
+        if len(row_texts) < 2 or len(row_texts) > 12:
             continue
         
         # CHECK: First item looks like a REAL name (not OCR garbage)
         first = row_texts[0].strip()
         
-        # Name must be at least 4 chars (e.g. "John") or contain a space (e.g. "Jo B")
-        if len(first) < 4 and ' ' not in first:
+        # Name must be at least 3 chars (e.g. "Amy") or contain a space (e.g. "Jo B")
+        if len(first) < 3 and ' ' not in first:
             continue
         
         # Skip common OCR artifacts that look like short words
-        garbage_names = ["IN", "UY", "DY", "JN", "XN", "DN", "BN", "FT", "PT", "IPT", "EFT", "IFT"]
+        garbage_names = ["IN", "UY", "DY", "JN", "XN", "DN", "BN", "FT", "PT", "IPT", "EFT", "IFT", "EY", "UN"]
         if first.upper() in garbage_names:
             continue
         
@@ -1374,24 +1446,38 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
         # State code must be in a position that makes sense (not just anywhere)
         has_state = bool(re.search(r'\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b', row_joined))
         
-        # REQUIRE: Must have a date (DOB) - this is the strongest indicator
-        if not has_date:
-            continue
+        # Check for relationship keywords (indicates non-business family member)
+        relationship_keywords = ["WIFE", "HUSBAND", "SPOUSE", "SON", "DAUGHTER", "CHILD", "MOTHER", "FATHER", 
+                                  "BROTHER", "SISTER", "PARENT", "FAMILY", "DRIVER", "MEMBER", "DOMESTIC"]
+        has_relationship = any(kw in row_text_upper for kw in relationship_keywords)
         
-        # Also need at least license OR state
-        if not (has_license or has_state):
-            continue
+        # VALIDATION RULES based on section:
+        if current_section == "non_business":
+            # NON-BUSINESS: Accept if has relationship keyword OR has DOB
+            # Family members often don't have DOB/license filled in
+            if not (has_relationship or has_date):
+                continue
+        elif current_section == "business" or current_section is None:
+            # BUSINESS: Must have DOB AND (license OR state)
+            if not has_date:
+                continue
+            if not (has_license or has_state):
+                continue
         
-        # MATCH CHECKBOXES by finding closest Y position
-        status_val = "?"
-        personal_val = "?"
-        if checkbox_status_map:
-            closest_cb_y = min(checkbox_status_map.keys(), key=lambda cy: abs(cy - row_y))
-            if abs(closest_cb_y - row_y) < 50:  # Within 50 pixels
-                status_val, personal_val = checkbox_status_map[closest_cb_y]
+        # Build employee record - strip leading empty columns and OCR artifacts
+        # First, remove leading empty strings to normalize column positions
+        non_empty_start = 0
+        for i, t in enumerate(row_texts):
+            if t and t.strip():
+                non_empty_start = i
+                break
         
-        # Build employee record - clean up OCR artifacts
-        clean_row = [t for t in row_texts if t.upper() not in ["FT", "PT", "Y", "N", "JN", "XN", "DN", "BN", "EFT", "IFT", "IPT", "IN"]]
+        # Use data starting from first non-empty column
+        data_row = row_texts[non_empty_start:]
+        
+        # Also create a filtered version without OCR artifacts for fallback
+        garbage_patterns = ["FT", "PT", "Y", "N", "JN", "XN", "DN", "BN", "EFT", "IFT", "IPT", "IN", "EY", "UN", "BFT", "OPT"]
+        clean_row = [t for t in data_row if t and t.strip() and t.upper() not in garbage_patterns]
         
         # Helper to format DOB as MM/DD/YYYY with leading zeros
         def format_dob(dob_str):
@@ -1410,30 +1496,99 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
                 return f"{month}/{day}/{year}"
             return dob_str
         
-        # Parse fields: NAME | LICENSE # | STATE | DOB | POSITION
-        name = clean_row[0] if len(clean_row) > 0 else "?"
-        license_num = clean_row[1] if len(clean_row) > 1 else "?"
-        state = clean_row[2] if len(clean_row) > 2 else "?"
-        dob_raw = clean_row[3] if len(clean_row) > 3 else "?"
-        dob = format_dob(dob_raw)
-        position = clean_row[4] if len(clean_row) > 4 else "?"
+        # Pattern-based field extraction (more robust than positional)
+        name = ""
+        license_num = ""
+        state = ""
+        dob = ""
+        position = ""
         
-        employee = {
-            "name": name,
-            "license": license_num,
-            "state": state,
-            "dob": dob,
-            "position": position,
-            "status": status_val,
-            "personal_use": personal_val
-        }
+        state_codes = ["AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"]
+        position_keywords = ["OWNER", "MANAGER", "SALES", "DRIVER", "EMPLOYEE", "OFFICER", "SECRETARY", "TREASURER", "PRESIDENT", "VP", "CEO", "PARTNER", "MEMBER", "CONTRACTOR", "AGENT"]
         
-        if current_section == "business":
-            business_employees.append(employee)
-        elif current_section == "non_business":
+        for item in clean_row:
+            if not item:
+                continue
+            item_stripped = item.strip()
+            item_upper = item_stripped.upper()
+            
+            # Check for DOB (date pattern) - highest priority identifier
+            if not dob and re.match(r'\d{1,2}/\d{1,2}/\d{2,4}', item_stripped):
+                dob = format_dob(item_stripped)
+            # Check for state code (2 letter)
+            elif not state and item_upper in state_codes:
+                state = item_upper
+            # Check for license (6+ alphanumeric)
+            elif not license_num and re.match(r'^[A-Z0-9]{6,}$', item_stripped, re.IGNORECASE):
+                license_num = item_stripped
+            # Check for position keyword
+            elif not position and any(kw in item_upper for kw in position_keywords):
+                position = item_stripped
+            # First remaining text is likely the name
+            elif not name and len(item_stripped) >= 3 and not re.match(r'^[A-Z0-9]{6,}$', item_stripped, re.IGNORECASE):
+                name = item_stripped
+        
+        if current_section == "non_business":
+            # NON-BUSINESS: Use pattern-based extraction, then search for relationship
+            relationship_keywords = ["WIFE", "HUSBAND", "SPOUSE", "SON", "DAUGHTER", "CHILD", "MOTHER", "FATHER", 
+                                      "BROTHER", "SISTER", "PARENT", "FAMILY", "DRIVER", "MEMBER", "DOMESTIC"]
+            
+            relationship = ""
+            for item in clean_row:
+                if item and any(kw in item.upper() for kw in relationship_keywords):
+                    relationship = item
+                    break
+            
+            # Skip if no name found
+            if not name:
+                continue
+            
+            # Match checkboxes from non-business map
+            personal_use = "?"
+            excl = "?"
+            if non_business_checkbox_map:
+                closest_cb_y = min(non_business_checkbox_map.keys(), key=lambda cy: abs(cy - row_y))
+                if abs(closest_cb_y - row_y) < 50:
+                    personal_use, excl = non_business_checkbox_map[closest_cb_y]
+            
+            employee = {
+                "name": name,
+                "license": license_num or "",
+                "state": state or "",
+                "dob": dob or "",
+                "relationship": relationship,
+                "personal_use": personal_use,
+                "excl": excl,
+                "is_non_business": True
+            }
             non_business_employees.append(employee)
+            append_to_chat("system", f"   ✓ Non-business: {name} | Rel: {relationship} | Use:{personal_use} | Excl:{excl}")
         else:
+            # BUSINESS: Use pattern-based extraction (name, license, state, dob, position already extracted)
+            # Skip if no name found
+            if not name:
+                continue
+            
+            # Match checkboxes from business map
+            status_val = "?"
+            personal_val = "?"
+            if business_checkbox_map:
+                closest_cb_y = min(business_checkbox_map.keys(), key=lambda cy: abs(cy - row_y))
+                if abs(closest_cb_y - row_y) < 50:
+                    status_val, personal_val = business_checkbox_map[closest_cb_y]
+            
+            employee = {
+                "name": name,
+                "license": license_num or "",
+                "state": state or "",
+                "dob": dob or "",
+                "position": position or "",
+                "status": status_val,
+                "personal_use": personal_val,
+                "is_non_business": False
+            }
             business_employees.append(employee)
+            append_to_chat("system", f"   ✓ Business: {name} | {license_num} | {state} | {dob} | {position} | {status_val}/{personal_val}")
     
     # ===== DISPLAY EMPLOYEE TABLE DIRECTLY IN CHAT =====
     append_to_chat("system", "\n" + "="*70)
@@ -1458,11 +1613,17 @@ def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
         append_to_chat("system", f"{'NAME':<25} {'LICENSE':<12} {'ST':<4} {'DOB':<12} {'REL':<10} {'USE':<4} {'EXCL':<4}")
         append_to_chat("system", "-" * 70)
         for emp in non_business_employees:
-            line = f"{emp['name']:<25} {emp['license']:<12} {emp['state']:<4} {emp['dob']:<12} {emp['position']:<10} {emp['status']:<4} {emp['personal_use']:<4}"
+            rel = emp.get('relationship', '?')
+            use = emp.get('personal_use', '?')
+            excl = emp.get('excl', '?')
+            line = f"{emp['name']:<25} {emp['license']:<12} {emp['state']:<4} {emp['dob']:<12} {rel:<10} {use:<4} {excl:<4}"
             append_to_chat("system", line)
         context_parts.append("\n=== NON-BUSINESS PERSONNEL ===")
         for i, emp in enumerate(non_business_employees):
-            context_parts.append(f"Person {i+1}: {emp['name']} | {emp['license']} | {emp['state']} | {emp['dob']} | {emp['position']} | Personal Use: {emp['status']} | Excl: {emp['personal_use']}")
+            rel = emp.get('relationship', '?')
+            use = emp.get('personal_use', '?')
+            excl = emp.get('excl', '?')
+            context_parts.append(f"Person {i+1}: {emp['name']} | {emp['license']} | {emp['state']} | {emp['dob']} | Relationship: {rel} | Personal Use: {use} | Excl: {excl}")
     
     if not business_employees and not non_business_employees:
         append_to_chat("system", "⚠️ No valid employee rows detected.")
@@ -1914,7 +2075,7 @@ def build_tab(parent):
                     imported = 0
                     skipped = 0
                     
-                    for emp in extracted_employees:
+                    for i, emp in enumerate(extracted_employees, 1):
                         # Convert employee dict to MVR format
                         # First name = first word, Last name = LAST word only (not middle names)
                         name_parts = emp.get('name', '').strip().split()
@@ -1932,18 +2093,23 @@ def build_tab(parent):
                             'extracted_text': f"Direct extraction from dealer application\nName: {emp.get('name')}\nLicense: {emp.get('license')}\nState: {emp.get('state')}\nDOB: {emp.get('dob')}\nStatus: {emp.get('status')}\nPersonal Use: {emp.get('personal_use')}"
                         }
                         
+                        # Debug: Show what we're sending
+                        append_to_chat("system", f"\n   Processing entry {i}/{len(extracted_employees)}:")
+                        append_to_chat("system", f"      Name: '{first_name}' '{last_name}' (from: '{emp.get('name')}')")
+                        append_to_chat("system", f"      License: '{mvr_data['license_number']}', State: '{mvr_data['state']}', DOB: '{mvr_data['dob']}'")
+                        
                         try:
                             import copy
                             success, message = callback(copy.deepcopy(mvr_data), source="Direct OCR")
                             if success:
                                 imported += 1
-                                append_to_chat("system", f"   ✓ Imported: {first_name} {last_name}")
+                                append_to_chat("system", f"      ✓ Imported: {first_name} {last_name}")
                             else:
                                 skipped += 1
-                                append_to_chat("system", f"   ⚠ Skipped: {first_name} {last_name} - {message}")
+                                append_to_chat("system", f"      ⚠ Skipped: {first_name} {last_name} - {message}")
                         except Exception as e:
                             skipped += 1
-                            append_to_chat("system", f"   ✗ Error: {first_name} {last_name} - {str(e)}")
+                            append_to_chat("system", f"      ✗ Error: {first_name} {last_name} - {str(e)}")
                     
                     if imported > 0:
                         append_to_chat("system", f"\n✅ Successfully imported {imported}/{len(extracted_employees)} employees to MVR Runner")
