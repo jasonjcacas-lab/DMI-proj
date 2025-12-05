@@ -18,7 +18,7 @@ TABS_DIR = os.path.dirname(THIS_DIR)
 PROJECT_ROOT = os.path.dirname(TABS_DIR)
 DEFAULT_OUTPUT_DIR = os.path.join(PROJECT_ROOT, "Bindocs_output")
 RULES_PATH = os.path.join(THIS_DIR, "rules.json")
-_UI_SETTINGS_PATH = os.path.join(PROJECT_ROOT, "ui_settings.json")
+_UI_SETTINGS_PATH = os.path.join(PROJECT_ROOT, "config", "ui_settings.json")
 _SIZE_PRESETS = {
     "Small": {"geometry": (640, 480), "progress_thickness": 4},
     "Medium": {"geometry": (760, 540), "progress_thickness": 6},

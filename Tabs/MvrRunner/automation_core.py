@@ -15,6 +15,11 @@ except Exception:
     sync_playwright = None
 
 try:
+    import sys
+    import os
+    _legacy_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "legacy")
+    if _legacy_path not in sys.path:
+        sys.path.insert(0, _legacy_path)
     from legacy_form_helpers import set_select_dropdown_value, fill_text_input
 except Exception:
     set_select_dropdown_value = None

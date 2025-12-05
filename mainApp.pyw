@@ -167,6 +167,26 @@ def main():
             except Exception:
                 pass
 
+    # Add Dealer Application Reader tab (optional if module exists)
+    try:
+        from Tabs import DealerAppReader  # type: ignore
+        dealer_tab = DealerAppReader.build_tab(notebook)
+        notebook.add(dealer_tab, text="Dealer App Reader")
+    except Exception as e:
+        # Fallback: try to load directly from file path (new folder structure)
+        try:
+            dealer_path = os.path.join(APP_DIR, "Tabs", "DealerAppReader", "main.py")
+            if os.path.isfile(dealer_path):
+                spec = importlib.util.spec_from_file_location("Tabs.DealerAppReader.main", dealer_path)
+                dealer_mod = importlib.util.module_from_spec(spec)  # type: ignore
+                assert spec is not None and spec.loader is not None
+                spec.loader.exec_module(dealer_mod)  # type: ignore
+                dealer_tab = dealer_mod.build_tab(notebook)  # type: ignore
+                notebook.add(dealer_tab, text="Dealer App Reader")
+        except Exception as e2:
+            # Silently fail - this is an optional tab
+            pass
+
     # Add Ollama AI Tool tab (optional if module exists)
     try:
         from Tabs import OllamaTool  # type: ignore

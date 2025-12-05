@@ -91,7 +91,7 @@ except ImportError:
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _TABS_DIR = os.path.dirname(_THIS_DIR)
 _PROJECT_ROOT = os.path.dirname(_TABS_DIR)
-_SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "ollama_settings.json")
+_SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "config", "ollama_settings.json")
 
 # Default settings
 _DEFAULT_SETTINGS = {
@@ -339,23 +339,33 @@ def _chat_with_ollama(api_url: str, model: str, messages: List[Dict], settings: 
     
     try:
         # Prepare the request - use STREAMING for no timeout
+        # Add system message if not present to guide the model
+        has_system = any(msg.get("role") == "system" for msg in messages)
+        if not has_system:
+            # Add system message to guide the model
+            system_msg = {
+                "role": "system",
+                "content": "You are a helpful assistant that extracts and displays employee information from documents. When asked to list employee info, extract ALL employee data from the provided document content and display it in a clear, organized format. Include names, license numbers, states, DOBs, positions, status (FT/PT), and personal use (Y/N)."
+            }
+            messages = [system_msg] + messages
+        
         payload = {
             "model": model,
             "messages": messages,
             "stream": True,  # Stream response chunks
             "options": {
                 "temperature": 0.3,
-                "num_predict": 256,  # Very short response
-                "num_ctx": 2048,
+                "num_predict": 512,  # Balanced - enough for responses but not too slow
+                "num_ctx": 4096,  # Balanced context window - enough for data but faster
             }
         }
         
-        # Use streaming to avoid timeout
+        # Use streaming to avoid timeout - increased timeout for larger contexts
         response = requests.post(
             f"{api_url}/api/chat",
             json=payload,
             stream=True,
-            timeout=30  # Just 30 sec to START responding
+            timeout=120  # Increased to 120 seconds for larger contexts
         )
         
         if response.status_code == 200:
@@ -848,44 +858,20 @@ def format_table_as_text(table_data: List[List[str]]) -> str:
 
 
 # ==================== DOCUMENT TYPE DETECTION ====================
-# Cues for identifying Dealer Applications (same as Binder Splitter)
-_DEALER_APP_CUES = [
-    r'(?i)\bDEALER\s+APPLICATION\b',
-    r'(?i)\bNEW\s+BUSINESS\s+QUOTE\b',
-    r'(?i)\bRENEWAL\s+OF\s+POL\b',
-]
-
-# Cues for page 2 employee tables
-_EMPLOYEE_TABLE_CUES = [
-    r'(?i)\bBUSINESS\s+PERSONNEL\b',
-    r'(?i)\bNON\s*-?\s*BUSINESS\s+PERSONNEL\b',
-    r'(?i)\bLIST\s+ALL\s+OWNERS\s*/?\s*OFFICERS\b',
-    r'(?i)\bLIST\s+ALL\s+SPOUSES\b',
-]
-
-
 def _detect_pdf_type(file_path: str) -> Dict:
     """
-    Detect if a PDF is text-based or scanned, and if it's a dealer application.
+    Detect if a PDF is text-based or scanned.
     
     Returns:
         {
             "is_text_based": bool,  # True if PDF has text layer
             "is_scanned": bool,     # True if PDF appears to be scanned (no text layer)
-            "is_dealer_app": bool,  # True if it's a dealer application
-            "has_employee_tables": bool,  # True if it has BUSINESS/NON-BUSINESS PERSONNEL
-            "employee_table_pages": list,  # Page numbers (0-indexed) with employee tables
             "text_layer": str,      # Extracted text layer (if any)
         }
     """
-    import re
-    
     result = {
         "is_text_based": False,
         "is_scanned": True,
-        "is_dealer_app": False,
-        "has_employee_tables": False,
-        "employee_table_pages": [],
         "text_layer": "",
     }
     
@@ -902,39 +888,18 @@ def _detect_pdf_type(file_path: str) -> Dict:
             page_text = page.get_text()
             text_parts.append(page_text)
             total_text_chars += len(page_text.strip())
-            
-            # Check if this page has employee tables
-            for pattern in _EMPLOYEE_TABLE_CUES:
-                if re.search(pattern, page_text):
-                    if page_num not in result["employee_table_pages"]:
-                        result["employee_table_pages"].append(page_num)
-                    result["has_employee_tables"] = True
         
-        num_pages = len(doc)
         doc.close()
         
         # Combine text for analysis
         full_text = "\n\n".join([f"--- Page {i+1} ---\n{t}" for i, t in enumerate(text_parts) if t.strip()])
         result["text_layer"] = full_text
         
-        # Check if it's a dealer application FIRST (before we use it in logic below)
-        for pattern in _DEALER_APP_CUES:
-            if re.search(pattern, full_text):
-                result["is_dealer_app"] = True
-                break
-        
         # Determine if text-based or scanned
         # A text-based PDF has substantial text (>500 chars for multi-page doc)
         if total_text_chars > 500:
             result["is_text_based"] = True
             result["is_scanned"] = False
-        
-        # IMPORTANT: For scanned PDFs, we can't detect employee tables from text
-        # If it's a dealer app and we didn't find employee table pages, assume page 2 (index 1)
-        if result["is_dealer_app"] and not result["employee_table_pages"]:
-            if num_pages >= 2:
-                result["employee_table_pages"] = [1]  # Page 2 = index 1
-                result["has_employee_tables"] = True
         
     except Exception as e:
         pass
@@ -1023,627 +988,9 @@ def _detect_table_with_opencv(img_array, append_to_chat):
     return row_ys, col_xs
 
 
-def _process_dealer_app_image(img, page_num, append_to_chat, update_status):
-    """
-    Process a dealer application page image.
-    Uses OpenCV to detect table structure + EasyOCR to read cells.
-    
-    Returns:
-        Dict with 'text', 'tables', 'checkboxes', 'context'
-    """
-    import cv2
-    import numpy as np
-    
-    result = {
-        'text': '',
-        'tables': [],
-        'checkboxes': [],
-        'context': ''
-    }
-    
-    if not _PIL_AVAILABLE or img is None:
-        return result
-    
-    extracted_text = None
-    tables = []
-    table_rows = []
-    
-    # Convert to numpy array
-    img_array = np.array(img)
-    img_height, img_width = img_array.shape[:2]
-    
-    append_to_chat("system", f"🖼️ Image size: {img_width}x{img_height} pixels")
-    
-    # ===== STEP 1: Use OpenCV to detect table structure =====
-    append_to_chat("system", "📐 Step 1: Detecting table structure with OpenCV...")
-    row_ys, col_xs = _detect_table_with_opencv(img_array, append_to_chat)
-    
-    # ===== STEP 2: Use EasyOCR to read the entire image =====
-    append_to_chat("system", "🔍 Step 2: Running EasyOCR to extract text...")
-    update_status("Running EasyOCR - this may take 30-60 seconds...")
-    
-    all_text_items = []  # List of (x, y, text, bbox)
-    
-    if _EASYOCR_AVAILABLE:
-        try:
-            reader = easyocr.Reader(['en'], gpu=False)
-            ocr_result = reader.readtext(img_array, detail=1, paragraph=False, mag_ratio=1.5, min_size=10, width_ths=0.3, height_ths=0.3)
-            
-            for line_result in ocr_result:
-                if line_result and len(line_result) >= 2:
-                    text = line_result[1] if isinstance(line_result[1], str) else str(line_result[1])
-                    if text and text.strip():
-                        bbox = line_result[0]
-                        if bbox and len(bbox) >= 4:
-                            x_center = sum([point[0] for point in bbox]) / len(bbox)
-                            y_center = sum([point[1] for point in bbox]) / len(bbox)
-                            all_text_items.append((x_center, y_center, text.strip(), bbox))
-            
-            append_to_chat("system", f"   ✓ EasyOCR found {len(all_text_items)} text items")
-            
-        except Exception as e:
-            append_to_chat("system", f"   EasyOCR error: {str(e)}")
-    
-    # ===== STEP 3: Organize text into table rows using detected lines OR Y-clustering =====
-    append_to_chat("system", "📊 Step 3: Organizing text into table rows...")
-    
-    # Store rows WITH their Y-positions for checkbox matching
-    table_rows_with_y = []  # List of (avg_y, [text1, text2, ...])
-    # Also store with X positions for column mapping
-    table_rows_with_xy = []  # List of (avg_y, [(x, text), ...])
-    
-    # Create column boundaries from detected vertical lines
-    col_boundaries = []
-    if col_xs and len(col_xs) > 1:
-        col_xs_sorted = sorted(col_xs)
-        for i in range(len(col_xs_sorted) - 1):
-            col_boundaries.append((col_xs_sorted[i], col_xs_sorted[i + 1]))
-        append_to_chat("system", f"   Using {len(col_boundaries)} column boundaries")
-    
-    if row_ys and len(row_ys) > 2:
-        # Use detected horizontal lines to group rows
-        append_to_chat("system", f"   Using {len(row_ys)} detected row lines")
-        
-        # Create row boundaries
-        row_boundaries = []
-        for i in range(len(row_ys) - 1):
-            row_boundaries.append((row_ys[i], row_ys[i + 1]))
-        
-        # Assign text items to rows
-        for y_start, y_end in row_boundaries:
-            row_items = [(x, y, text, bbox) for x, y, text, bbox in all_text_items 
-                        if y_start <= y <= y_end]
-            if row_items:
-                row_items.sort(key=lambda item: item[0])  # Sort by X
-                avg_y = sum(item[1] for item in row_items) / len(row_items)
-                
-                # If we have column boundaries, map text to columns (detecting blanks)
-                if col_boundaries:
-                    row_by_col = [""] * len(col_boundaries)  # Initialize all columns as blank
-                    for x, y, text, bbox in row_items:
-                        # Find which column this text belongs to
-                        for col_idx, (col_start, col_end) in enumerate(col_boundaries):
-                            if col_start <= x <= col_end:
-                                # Append to existing text in column (in case multiple items per cell)
-                                if row_by_col[col_idx]:
-                                    row_by_col[col_idx] += " " + text
-                                else:
-                                    row_by_col[col_idx] = text
-                                break
-                    row_texts = row_by_col
-                else:
-                    row_texts = [item[2] for item in row_items]
-                
-                table_rows.append(row_texts)
-                table_rows_with_y.append((avg_y, row_texts))
-                table_rows_with_xy.append((avg_y, [(item[0], item[2]) for item in row_items]))
-    else:
-        # Fallback: Use Y-clustering (like PNG method)
-        append_to_chat("system", "   No table lines detected, using Y-clustering")
-        
-        if all_text_items:
-            all_text_items.sort(key=lambda item: item[1])  # Sort by Y
-            
-            y_tolerance = 25
-            current_row = [all_text_items[0]]
-            current_y = all_text_items[0][1]
-            
-            for item in all_text_items[1:]:
-                x, y, text, bbox = item
-                if abs(y - current_y) < y_tolerance:
-                    current_row.append(item)
-                else:
-                    current_row.sort(key=lambda r: r[0])
-                    avg_y = sum(r[1] for r in current_row) / len(current_row)
-                    table_rows.append([r[2] for r in current_row])
-                    table_rows_with_y.append((avg_y, [r[2] for r in current_row]))
-                    current_row = [item]
-                    current_y = y
-            
-            if current_row:
-                current_row.sort(key=lambda r: r[0])
-                avg_y = sum(r[1] for r in current_row) / len(current_row)
-                table_rows.append([r[2] for r in current_row])
-                table_rows_with_y.append((avg_y, [r[2] for r in current_row]))
-    
-    if table_rows:
-        tables.append({"page": page_num, "table": table_rows, "method": "opencv+easyocr"})
-        append_to_chat("system", f"   ✓ Organized into {len(table_rows)} rows")
-    
-    # Build extracted text
-    extracted_text = "\n".join([" | ".join(row) for row in table_rows])
-    
-    # ===== DEBUG: Show detected rows =====
-    if table_rows:
-        append_to_chat("system", "\n📊 TABLE ROWS DETECTED (first 10):")
-        for i, row in enumerate(table_rows[:10]):
-            row_preview = " | ".join(str(c) for c in row[:8])
-            append_to_chat("system", f"  Row {i+1}: {row_preview}")
-        if len(table_rows) > 10:
-            append_to_chat("system", f"  ... and {len(table_rows) - 10} more rows")
-    
-    # ===== CHECKBOX DETECTION (critical for FT/PT and Y/N) =====
-    checkbox_info = ""
-    checkboxes = []
-    try:
-        import cv2
-        import numpy as np
-        
-        append_to_chat("system", "☑️ Running checkbox detection for FT/PT and Y/N fields...")
-        update_status("Detecting checkboxes on employee table...")
-        
-        # Convert PIL image to OpenCV format
-        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
-        
-        # Binary threshold
-        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-        
-        # Find contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # Checkbox detection parameters (image is 3x zoom now)
-        min_size = 25  # Minimum checkbox size (larger for 3x zoom)
-        max_size = 100  # Maximum checkbox size
-        
-        for cnt in contours:
-            x, y, box_w, box_h = cv2.boundingRect(cnt)
-            
-            # Filter by size
-            if not (min_size < box_w < max_size and min_size < box_h < max_size):
-                continue
-            
-            # Filter by aspect ratio (checkboxes are roughly square)
-            aspect_ratio = box_w / float(box_h)
-            if not (0.7 < aspect_ratio < 1.4):
-                continue
-            
-            # Check fill ratio to determine if checked
-            roi = gray[y:y+box_h, x:x+box_w]
-            if roi.size == 0:
-                continue
-            
-            margin = max(2, int(box_w * 0.15))
-            inner = roi[margin:-margin, margin:-margin] if margin * 2 < min(box_w, box_h) else roi
-            
-            if inner.size == 0:
-                continue
-            
-            dark_pixels = np.sum(inner < 128)
-            fill_ratio = dark_pixels / inner.size
-            
-            # Determine if checked (X marks have ~5-15% fill, filled ~20%+)
-            is_checked = fill_ratio > 0.04
-            
-            checkboxes.append({
-                'x': x, 'y': y, 'width': box_w, 'height': box_h,
-                'checked': is_checked, 'fill_ratio': round(fill_ratio, 3)
-            })
-        
-        # Sort by position
-        checkboxes.sort(key=lambda c: (c['y'] // 30, c['x']))
-        
-        if checkboxes:
-            checked_list = [c for c in checkboxes if c['checked']]
-            unchecked_list = [c for c in checkboxes if not c['checked']]
-            append_to_chat("system", f"✓ Found {len(checkboxes)} checkboxes: {len(checked_list)} checked, {len(unchecked_list)} unchecked")
-            
-            # DEBUG: Show checkbox details
-            append_to_chat("system", "\n☑️ CHECKBOX DETAILS (first 10):")
-            for i, cb in enumerate(checkboxes[:10]):
-                status = "☑ CHECKED" if cb['checked'] else "☐ empty"
-                append_to_chat("system", f"  #{i+1}: Y={cb['y']}, X={cb['x']}, fill={cb['fill_ratio']:.1%} → {status}")
-            
-            # Group checkboxes by row (Y position) and identify FT/PT + Y/N columns
-            # Typically: FT and PT are adjacent, then Y and N are adjacent
-            img_width = img.size[0]
-            
-            # Group by row
-            rows_of_checkboxes = {}
-            y_tolerance = 25
-            for cb in checkboxes:
-                row_key = cb['y'] // y_tolerance
-                if row_key not in rows_of_checkboxes:
-                    rows_of_checkboxes[row_key] = []
-                rows_of_checkboxes[row_key].append(cb)
-            
-            # Create human-readable checkbox mapping
-            checkbox_lines = []
-            checkbox_lines.append("FORMAT: Row Y-position | FT/PT Status | Personal Use (Y/N)")
-            checkbox_lines.append("-" * 50)
-            
-            for row_key in sorted(rows_of_checkboxes.keys()):
-                row_cbs = sorted(rows_of_checkboxes[row_key], key=lambda c: c['x'])
-                
-                # Typical pattern: 4 checkboxes per row (FT, PT, Y, N)
-                if len(row_cbs) >= 4:
-                    ft_checked = row_cbs[0]['checked']
-                    pt_checked = row_cbs[1]['checked']
-                    y_checked = row_cbs[2]['checked']
-                    n_checked = row_cbs[3]['checked']
-                    
-                    status = "Full-Time" if ft_checked else ("Part-Time" if pt_checked else "Unknown")
-                    personal_use = "Yes" if y_checked else ("No" if n_checked else "Unknown")
-                    
-                    checkbox_lines.append(f"Row ~{row_key * y_tolerance}: Status={status}, Personal Use={personal_use}")
-                elif len(row_cbs) == 2:
-                    # Might be just FT/PT or just Y/N
-                    cb1_checked = row_cbs[0]['checked']
-                    cb2_checked = row_cbs[1]['checked']
-                    checkbox_lines.append(f"Row ~{row_key * y_tolerance}: Checkbox1={'☑' if cb1_checked else '☐'}, Checkbox2={'☑' if cb2_checked else '☐'}")
-            
-            checkbox_info = "\n=== CHECKBOX STATUS (FT/PT and Personal Use) ===\n" + "\n".join(checkbox_lines)
-        else:
-            append_to_chat("system", "⚠ No checkboxes detected")
-                
-    except Exception as e:
-        append_to_chat("system", f"Checkbox detection error: {str(e)}")
-    
-    # ===== BUILD EMPLOYEE TABLE WITH CHECKBOX VALUES =====
-    import re
-    context_parts = [f"=== DEALER APPLICATION - PAGE {page_num} ==="]
-    
-    business_employees = []
-    non_business_employees = []
-    current_section = None
-    
-    # First pass: Find the Y-coordinate where NON-BUSINESS section starts
-    non_business_start_y = None
-    append_to_chat("system", "\n🔍 Searching for NON-BUSINESS section header...")
-    for row_y, row_texts in table_rows_with_y:
-        row_text_upper = " ".join(row_texts).upper()
-        # Check for various OCR variations of "NON-BUSINESS"
-        if any(nb in row_text_upper for nb in ["NON-BUSINESS", "NON BUSINESS", "NONBUSINESS", "NON-BUS", "NONBUS"]):
-            non_business_start_y = row_y
-            append_to_chat("system", f"   ✓ Found NON-BUSINESS header at Y={row_y}: {row_text_upper[:60]}...")
-            break
-        # Also check for "SPOUSES" or "FAMILY" which indicates non-business section
-        if "SPOUSES" in row_text_upper or "FAMILY MEMBERS" in row_text_upper or "HOUSEHOLD" in row_text_upper:
-            non_business_start_y = row_y
-            append_to_chat("system", f"   ✓ Found family/household header at Y={row_y}: {row_text_upper[:60]}...")
-            break
-    
-    if non_business_start_y is None:
-        append_to_chat("system", "   ⚠️ NON-BUSINESS section header NOT found in OCR text")
-        # Show some rows to help debug
-        append_to_chat("system", "   Sample rows searched:")
-        for i, (row_y, row_texts) in enumerate(table_rows_with_y):
-            if i >= 15:  # Show first 15 rows
-                break
-            row_text = " ".join(row_texts)
-            if len(row_text) > 5:  # Only show non-trivial rows
-                append_to_chat("system", f"     Y={row_y}: {row_text[:80]}...")
-    
-    # Build separate checkbox maps for business vs non-business sections
-    business_checkbox_map = {}  # Maps Y -> (status, personal_use)
-    non_business_checkbox_map = {}  # Maps Y -> (personal_use, excl)
-    
-    if checkboxes:
-        y_tolerance = 40
-        checkbox_by_row = {}
-        img_width = img.size[0]
-        right_threshold = img_width * 0.75
-        
-        rightmost_checkboxes = [cb for cb in checkboxes if cb['x'] > right_threshold]
-        
-        for cb in rightmost_checkboxes:
-            row_key = cb['y'] // y_tolerance
-            if row_key not in checkbox_by_row:
-                checkbox_by_row[row_key] = []
-            checkbox_by_row[row_key].append(cb)
-        
-        for row_key, row_cbs in checkbox_by_row.items():
-            row_cbs_sorted = sorted(row_cbs, key=lambda c: c['x'])
-            avg_y = row_key * y_tolerance + y_tolerance // 2
-            
-            # Determine if this row is in business or non-business section
-            is_non_business = non_business_start_y is not None and avg_y > non_business_start_y
-            
-            if len(row_cbs_sorted) >= 4:
-                if is_non_business:
-                    # Non-business: Y, N (personal use), Y, N (excl)
-                    y_personal = row_cbs_sorted[0]['checked']
-                    n_personal = row_cbs_sorted[1]['checked']
-                    y_excl = row_cbs_sorted[2]['checked']
-                    n_excl = row_cbs_sorted[3]['checked']
-                    personal = "Y" if y_personal else ("N" if n_personal else "?")
-                    excl = "Y" if y_excl else ("N" if n_excl else "?")
-                    non_business_checkbox_map[avg_y] = (personal, excl)
-                else:
-                    # Business: FT, PT, Y, N
-                    ft = row_cbs_sorted[0]['checked']
-                    pt = row_cbs_sorted[1]['checked']
-                    y_use = row_cbs_sorted[2]['checked']
-                    n_use = row_cbs_sorted[3]['checked']
-                    status = "FT" if ft else ("PT" if pt else "?")
-                    personal = "Y" if y_use else ("N" if n_use else "?")
-                    business_checkbox_map[avg_y] = (status, personal)
-            elif len(row_cbs_sorted) == 2:
-                # Only 2 checkboxes - assume Y/N pattern
-                y_val = row_cbs_sorted[0]['checked']
-                n_val = row_cbs_sorted[1]['checked']
-                val = "Y" if y_val else ("N" if n_val else "?")
-                if is_non_business:
-                    non_business_checkbox_map[avg_y] = (val, "?")
-                else:
-                    business_checkbox_map[avg_y] = ("?", val)
-    
-    # Process table_rows_with_y to match checkboxes
-    append_to_chat("system", f"\n📊 Processing {len(table_rows_with_y)} rows for employee data...")
-    for row_y, row_texts in table_rows_with_y:
-        row_text_upper = " ".join(row_texts).upper()
-        
-        # Detect section headers
-        if "BUSINESS PERSONNEL" in row_text_upper and "NON" not in row_text_upper:
-            current_section = "business"
-            append_to_chat("system", f"   📁 Switched to BUSINESS section at Y={row_y}")
-            continue
-        elif any(nb in row_text_upper for nb in ["NON-BUSINESS", "NON BUSINESS", "NONBUSINESS", "NON-BUS", "SPOUSES", "FAMILY", "HOUSEHOLD"]):
-            current_section = "non_business"
-            append_to_chat("system", f"   📁 Switched to NON-BUSINESS section at Y={row_y}")
-            continue
-        
-        # SKIP: Headers, instructions, questions
-        skip_patterns = [
-            "LIST ALL", "LICENSE #", "STATE", "DOB", "POSITION", "STATUS",
-            "TRANSPORTATION", "CONVICTED", "ALLOW", "BUYERS", "WHOLESALERS",
-            "DEALER PLATES", "PERSONAL USE", "VEHICLES", "INELIGIBLE", "COVERAGE",
-            "EXCLUDED", "POLICY", "COMMERCIAL", "TRANSPORTER", "MISCELLANEOUS",
-            "DRIVING VIOLATIONS", "DUI", "RECKLESS", "DO YOU", "HAVE ANY",
-            "IS PERFORMED", "AT NIGHT", "HOME", "INVENTORY", "RELATIONSHIP", "EXCL",
-            "ANYONE UNDER", "AGE OF", "BETWEEN", "CHILDREN"
-        ]
-        if any(p in row_text_upper for p in skip_patterns):
-            continue
-        
-        # SKIP: Too short or too long
-        if len(row_texts) < 2 or len(row_texts) > 12:
-            continue
-        
-        # CHECK: First item looks like a REAL name (not OCR garbage)
-        first = row_texts[0].strip()
-        
-        # Name must be at least 3 chars (e.g. "Amy") or contain a space (e.g. "Jo B")
-        if len(first) < 3 and ' ' not in first:
-            continue
-        
-        # Skip common OCR artifacts that look like short words
-        garbage_names = ["IN", "UY", "DY", "JN", "XN", "DN", "BN", "FT", "PT", "IPT", "EFT", "IFT", "EY", "UN"]
-        if first.upper() in garbage_names:
-            continue
-        
-        # Name should not be just letters/numbers that look like checkbox OCR
-        if re.match(r'^[IFTPYN]{1,3}$', first.upper()):
-            continue
-        
-        # CHECK: Has date pattern (most reliable indicator of employee row)
-        row_joined = " ".join(row_texts)
-        has_date = bool(re.search(r'\d{1,2}/\d{1,2}/\d{2,4}', row_joined))
-        
-        # License must be 6+ alphanumeric chars (not short codes)
-        has_license = bool(re.search(r'[A-Z0-9]{6,}', row_joined, re.IGNORECASE))
-        
-        # State code must be in a position that makes sense (not just anywhere)
-        has_state = bool(re.search(r'\b(AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY)\b', row_joined))
-        
-        # Check for relationship keywords (indicates non-business family member)
-        relationship_keywords = ["WIFE", "HUSBAND", "SPOUSE", "SON", "DAUGHTER", "CHILD", "MOTHER", "FATHER", 
-                                  "BROTHER", "SISTER", "PARENT", "FAMILY", "DRIVER", "MEMBER", "DOMESTIC"]
-        has_relationship = any(kw in row_text_upper for kw in relationship_keywords)
-        
-        # VALIDATION RULES based on section:
-        if current_section == "non_business":
-            # NON-BUSINESS: Accept if has relationship keyword OR has DOB
-            # Family members often don't have DOB/license filled in
-            if not (has_relationship or has_date):
-                continue
-        elif current_section == "business" or current_section is None:
-            # BUSINESS: Must have DOB AND (license OR state)
-            if not has_date:
-                continue
-            if not (has_license or has_state):
-                continue
-        
-        # Build employee record - strip leading empty columns and OCR artifacts
-        # First, remove leading empty strings to normalize column positions
-        non_empty_start = 0
-        for i, t in enumerate(row_texts):
-            if t and t.strip():
-                non_empty_start = i
-                break
-        
-        # Use data starting from first non-empty column
-        data_row = row_texts[non_empty_start:]
-        
-        # Also create a filtered version without OCR artifacts for fallback
-        garbage_patterns = ["FT", "PT", "Y", "N", "JN", "XN", "DN", "BN", "EFT", "IFT", "IPT", "IN", "EY", "UN", "BFT", "OPT"]
-        clean_row = [t for t in data_row if t and t.strip() and t.upper() not in garbage_patterns]
-        
-        # Helper to format DOB as MM/DD/YYYY with leading zeros
-        def format_dob(dob_str):
-            if not dob_str or dob_str == "?":
-                return "?"
-            # Match date pattern M/D/YYYY or MM/DD/YYYY
-            match = re.match(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})', dob_str)
-            if match:
-                month, day, year = match.groups()
-                # Pad with leading zeros
-                month = month.zfill(2)
-                day = day.zfill(2)
-                # Handle 2-digit years
-                if len(year) == 2:
-                    year = "19" + year if int(year) > 50 else "20" + year
-                return f"{month}/{day}/{year}"
-            return dob_str
-        
-        # Pattern-based field extraction (more robust than positional)
-        name = ""
-        license_num = ""
-        state = ""
-        dob = ""
-        position = ""
-        
-        state_codes = ["AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"]
-        position_keywords = ["OWNER", "MANAGER", "SALES", "DRIVER", "EMPLOYEE", "OFFICER", "SECRETARY", "TREASURER", "PRESIDENT", "VP", "CEO", "PARTNER", "MEMBER", "CONTRACTOR", "AGENT"]
-        
-        for item in clean_row:
-            if not item:
-                continue
-            item_stripped = item.strip()
-            item_upper = item_stripped.upper()
-            
-            # Check for DOB (date pattern) - highest priority identifier
-            if not dob and re.match(r'\d{1,2}/\d{1,2}/\d{2,4}', item_stripped):
-                dob = format_dob(item_stripped)
-            # Check for state code (2 letter)
-            elif not state and item_upper in state_codes:
-                state = item_upper
-            # Check for license (6+ alphanumeric)
-            elif not license_num and re.match(r'^[A-Z0-9]{6,}$', item_stripped, re.IGNORECASE):
-                license_num = item_stripped
-            # Check for position keyword
-            elif not position and any(kw in item_upper for kw in position_keywords):
-                position = item_stripped
-            # First remaining text is likely the name
-            elif not name and len(item_stripped) >= 3 and not re.match(r'^[A-Z0-9]{6,}$', item_stripped, re.IGNORECASE):
-                name = item_stripped
-        
-        if current_section == "non_business":
-            # NON-BUSINESS: Use pattern-based extraction, then search for relationship
-            relationship_keywords = ["WIFE", "HUSBAND", "SPOUSE", "SON", "DAUGHTER", "CHILD", "MOTHER", "FATHER", 
-                                      "BROTHER", "SISTER", "PARENT", "FAMILY", "DRIVER", "MEMBER", "DOMESTIC"]
-            
-            relationship = ""
-            for item in clean_row:
-                if item and any(kw in item.upper() for kw in relationship_keywords):
-                    relationship = item
-                    break
-            
-            # Skip if no name found
-            if not name:
-                continue
-            
-            # Match checkboxes from non-business map
-            personal_use = "?"
-            excl = "?"
-            if non_business_checkbox_map:
-                closest_cb_y = min(non_business_checkbox_map.keys(), key=lambda cy: abs(cy - row_y))
-                if abs(closest_cb_y - row_y) < 50:
-                    personal_use, excl = non_business_checkbox_map[closest_cb_y]
-            
-            employee = {
-                "name": name,
-                "license": license_num or "",
-                "state": state or "",
-                "dob": dob or "",
-                "relationship": relationship,
-                "personal_use": personal_use,
-                "excl": excl,
-                "is_non_business": True
-            }
-            non_business_employees.append(employee)
-            append_to_chat("system", f"   ✓ Non-business: {name} | Rel: {relationship} | Use:{personal_use} | Excl:{excl}")
-        else:
-            # BUSINESS: Use pattern-based extraction (name, license, state, dob, position already extracted)
-            # Skip if no name found
-            if not name:
-                continue
-            
-            # Match checkboxes from business map
-            status_val = "?"
-            personal_val = "?"
-            if business_checkbox_map:
-                closest_cb_y = min(business_checkbox_map.keys(), key=lambda cy: abs(cy - row_y))
-                if abs(closest_cb_y - row_y) < 50:
-                    status_val, personal_val = business_checkbox_map[closest_cb_y]
-            
-            employee = {
-                "name": name,
-                "license": license_num or "",
-                "state": state or "",
-                "dob": dob or "",
-                "position": position or "",
-                "status": status_val,
-                "personal_use": personal_val,
-                "is_non_business": False
-            }
-            business_employees.append(employee)
-            append_to_chat("system", f"   ✓ Business: {name} | {license_num} | {state} | {dob} | {position} | {status_val}/{personal_val}")
-    
-    # ===== DISPLAY EMPLOYEE TABLE DIRECTLY IN CHAT =====
-    append_to_chat("system", "\n" + "="*70)
-    append_to_chat("system", "📋 EXTRACTED EMPLOYEE DATA")
-    append_to_chat("system", "="*70)
-    
-    if business_employees:
-        append_to_chat("system", "\n👔 BUSINESS PERSONNEL:")
-        append_to_chat("system", "-" * 70)
-        append_to_chat("system", f"{'NAME':<25} {'LICENSE':<12} {'ST':<4} {'DOB':<12} {'POS':<10} {'ST':<4} {'USE':<4}")
-        append_to_chat("system", "-" * 70)
-        for emp in business_employees:
-            line = f"{emp['name']:<25} {emp['license']:<12} {emp['state']:<4} {emp['dob']:<12} {emp['position']:<10} {emp['status']:<4} {emp['personal_use']:<4}"
-            append_to_chat("system", line)
-        context_parts.append("\n=== BUSINESS PERSONNEL ===")
-        for i, emp in enumerate(business_employees):
-            context_parts.append(f"Employee {i+1}: {emp['name']} | {emp['license']} | {emp['state']} | {emp['dob']} | {emp['position']} | Status: {emp['status']} | Personal Use: {emp['personal_use']}")
-    
-    if non_business_employees:
-        append_to_chat("system", "\n👨‍👩‍👧 NON-BUSINESS PERSONNEL:")
-        append_to_chat("system", "-" * 70)
-        append_to_chat("system", f"{'NAME':<25} {'LICENSE':<12} {'ST':<4} {'DOB':<12} {'REL':<10} {'USE':<4} {'EXCL':<4}")
-        append_to_chat("system", "-" * 70)
-        for emp in non_business_employees:
-            rel = emp.get('relationship', '?')
-            use = emp.get('personal_use', '?')
-            excl = emp.get('excl', '?')
-            line = f"{emp['name']:<25} {emp['license']:<12} {emp['state']:<4} {emp['dob']:<12} {rel:<10} {use:<4} {excl:<4}"
-            append_to_chat("system", line)
-        context_parts.append("\n=== NON-BUSINESS PERSONNEL ===")
-        for i, emp in enumerate(non_business_employees):
-            rel = emp.get('relationship', '?')
-            use = emp.get('personal_use', '?')
-            excl = emp.get('excl', '?')
-            context_parts.append(f"Person {i+1}: {emp['name']} | {emp['license']} | {emp['state']} | {emp['dob']} | Relationship: {rel} | Personal Use: {use} | Excl: {excl}")
-    
-    if not business_employees and not non_business_employees:
-        append_to_chat("system", "⚠️ No valid employee rows detected.")
-        context_parts.append("No employee data found.")
-    else:
-        total = len(business_employees) + len(non_business_employees)
-        append_to_chat("system", f"\n✅ Total: {len(business_employees)} business + {len(non_business_employees)} non-business = {total} people")
-    
-    append_to_chat("system", "="*70)
-    
-    result['text'] = extracted_text or ''
-    result['tables'] = tables
-    result['checkboxes'] = checkboxes
-    result['context'] = "\n".join(context_parts)
-    # Store extracted employees for direct MVR export
-    result['employees'] = business_employees + non_business_employees
-    result['business_employees'] = business_employees
-    result['non_business_employees'] = non_business_employees
-    
-    return result
+# REMOVED: _process_dealer_app_image - Use DealerAppReader tab instead
+# This function was removed because dealer application processing is now handled
+# by the dedicated DealerAppReader tab.
 
 
 def _ocr_specific_pages(file_path: str, page_numbers: List[int], ocr_engine: str = "tesseract") -> str:
@@ -1766,7 +1113,7 @@ def extract_text_from_document(file_path: str, ocr_engine: str = "tesseract", ap
     Smart detection:
     - Text-based PDFs: Use text extraction (fast)
     - Scanned PDFs: Use OCR
-    - Dealer Applications: OCR page 2 (employee tables) - done separately via ocr_dealer_app_page2()
+    - For dealer applications, use the DealerAppReader tab instead
     """
     if not os.path.isfile(file_path):
         return f"File not found: {file_path}"
@@ -1778,10 +1125,6 @@ def extract_text_from_document(file_path: str, ocr_engine: str = "tesseract", ap
         # If it has text layer, return it (fast path)
         if pdf_info["is_text_based"] and pdf_info["text_layer"]:
             result = pdf_info["text_layer"]
-            
-            # Add metadata about document type
-            if pdf_info["is_dealer_app"]:
-                result = f"[DOCUMENT TYPE: Dealer Application]\n[HAS EMPLOYEE TABLES: {pdf_info['has_employee_tables']}]\n[EMPLOYEE TABLE PAGES: {pdf_info['employee_table_pages']}]\n\n{result}"
             
             return result
         
@@ -1804,22 +1147,9 @@ def extract_text_from_document(file_path: str, ocr_engine: str = "tesseract", ap
     return result if result else "No text could be extracted from the document."
 
 
-def ocr_dealer_app_page2(file_path: str, ocr_engine: str = "tesseract") -> str:
-    """
-    OCR specifically page 2 of a dealer application (employee tables).
-    Call this separately when you need the filled-in employee data.
-    
-    Returns:
-        OCR text from page 2 (employee tables)
-    """
-    pdf_info = _detect_pdf_type(file_path)
-    
-    if not pdf_info["has_employee_tables"]:
-        return "No employee tables found in this document."
-    
-    # OCR the employee table pages
-    pages = pdf_info["employee_table_pages"] if pdf_info["employee_table_pages"] else [1]  # Default to page 2
-    return _ocr_specific_pages(file_path, pages, ocr_engine)
+# REMOVED: ocr_dealer_app_page2 - Use DealerAppReader tab instead
+# This function was removed because dealer application processing is now handled
+# by the dedicated DealerAppReader tab.
 
 
 def build_tab(parent):
@@ -2920,24 +2250,92 @@ Do NOT skip the state field if you see ANY text in the STATE column.
         # Clear input
         input_text.delete("1.0", "end")
         
-        # Add document context ONLY if this is first question about the document
+        # Always include document context if available (not just first time)
         full_message = user_input
-        context_already_sent = any("Document Content" in msg.get("content", "") for msg in conversation_history)
+        context_already_sent = any("Document Content" in msg.get("content", "") for msg in conversation_history[-2:])  # Check last 2 messages
         
-        if document_context and not context_already_sent:
-            # Combine document context - limit to 4000 chars for speed
-            max_context_chars = 4000
+        # Check if user is asking about employees/data
+        is_employee_query = (
+            "employee" in user_input.lower() or 
+            "list" in user_input.lower() or 
+            "info" in user_input.lower() or
+            "data" in user_input.lower() or
+            "extract" in user_input.lower() or
+            "show" in user_input.lower()
+        )
+        
+        # Build context - prioritize extracted_employees if available
+        context_parts = []
+        
+        # First, add extracted_employees data if available (most reliable)
+        if extracted_employees and is_employee_query:
+            employee_data_text = "\n" + "="*70 + "\n"
+            employee_data_text += "📋 EXTRACTED EMPLOYEE DATA (STRUCTURED)\n"
+            employee_data_text += "="*70 + "\n\n"
+            
+            for i, emp in enumerate(extracted_employees, 1):
+                employee_data_text += f"Employee {i}:\n"
+                employee_data_text += f"  Name: {emp.get('name', 'N/A')}\n"
+                employee_data_text += f"  License Number: {emp.get('license', emp.get('license_number', 'N/A'))}\n"
+                employee_data_text += f"  State: {emp.get('state', 'N/A')}\n"
+                employee_data_text += f"  DOB: {emp.get('dob', 'N/A')}\n"
+                employee_data_text += f"  Position: {emp.get('position', 'N/A')}\n"
+                employee_data_text += f"  Status: {emp.get('status', 'N/A')} (FT=Full-Time, PT=Part-Time)\n"
+                employee_data_text += f"  Personal Use: {emp.get('personal_use', 'N/A')} (Y=Yes, N=No)\n\n"
+            
+            employee_data_text += "="*70 + "\n"
+            employee_data_text += "IMPORTANT: The above employee data has been extracted and verified. "
+            employee_data_text += "When asked to list employees, display ALL of the above information in a clear, organized format.\n"
+            employee_data_text += "="*70 + "\n\n"
+            
+            context_parts.append(employee_data_text)
+            append_to_chat("system", f"📋 Including {len(extracted_employees)} extracted employee(s) in context")
+        
+        # Then add document context if available
+        if document_context:
+            # Combine document context - balance between completeness and speed
+            max_context_chars = 8000  # Reduced from 12000 to prevent timeouts, but still more than before
             combined_context = ""
             for ctx in document_context[-1:]:  # Only last document
                 if len(ctx) < max_context_chars:
                     combined_context = ctx
                 else:
-                    combined_context = ctx[:max_context_chars] + "..."
+                    # Keep the beginning (headers/instructions) and end (data) - truncate middle if needed
+                    header_len = 1500  # Keep checkbox info and headers
+                    data_len = max_context_chars - header_len - 100
+                    combined_context = ctx[:header_len] + "\n\n[... truncated middle section ...]\n\n" + ctx[-data_len:]
                 break
             
-            if combined_context:
-                full_message = f"--- Document Content ---\n{combined_context}\n\n--- Question ---\n{user_input}"
-                append_to_chat("system", f"📄 Context: {len(combined_context)} chars sent to AI")
+            # Always include context if user is asking about employees/data
+            should_include_context = (
+                not context_already_sent or is_employee_query
+            )
+            
+            if combined_context and should_include_context:
+                context_parts.append(combined_context)
+        
+        # Combine all context parts
+        if context_parts:
+            # Add a system instruction to help AI understand employee data requests
+            system_instruction = ""
+            if is_employee_query:
+                system_instruction = "\n\n" + "="*70 + "\n"
+                system_instruction += "INSTRUCTIONS FOR AI:\n"
+                system_instruction += "="*70 + "\n"
+                system_instruction += "The user is asking you to list employee information. "
+                if extracted_employees:
+                    system_instruction += f"Above you will find {len(extracted_employees)} employee(s) with complete data. "
+                    system_instruction += "Display ALL employee information in a clear, organized format. "
+                    system_instruction += "Include: Name, License Number, State, DOB, Position, Status (FT/PT), and Personal Use (Y/N). "
+                else:
+                    system_instruction += "Look for employee table data in the document content above. "
+                    system_instruction += "Extract and display ALL employee information you find. "
+                system_instruction += "Do NOT say 'no employee data found' if you see employee information above.\n"
+                system_instruction += "="*70 + "\n\n"
+            
+            full_context = "\n\n".join(context_parts)
+            full_message = f"--- Document Content ---\n{full_context}{system_instruction}\n--- Question ---\n{user_input}"
+            append_to_chat("system", f"📄 Context: {len(full_context)} chars sent to AI")
         
         # Add to conversation
         append_to_chat("user", user_input)
@@ -3013,108 +2411,8 @@ Do NOT skip the state field if you see ANY text in the STATE column.
             try:
                 update_status("Analyzing document...")
                 
-                # First, detect if this is a dealer application
-                pdf_info = None
-                if file_path.lower().endswith('.pdf'):
-                    pdf_info = _detect_pdf_type(file_path)
-                
-                # ===== DEALER APPLICATION SPECIAL HANDLING =====
-                # Process page 2 (employee tables) as an IMAGE, like a pasted screenshot
-                if pdf_info:
-                    append_to_chat("system", f"📄 PDF Analysis:")
-                    append_to_chat("system", f"   • is_text_based: {pdf_info.get('is_text_based')}")
-                    append_to_chat("system", f"   • is_dealer_app: {pdf_info.get('is_dealer_app')}")
-                    append_to_chat("system", f"   • has_employee_tables: {pdf_info.get('has_employee_tables')}")
-                    append_to_chat("system", f"   • employee_table_pages: {pdf_info.get('employee_table_pages')}")
-                    
-                    # Show why it might not be detected
-                    text_preview = pdf_info.get('text_layer', '')[:200]
-                    if text_preview:
-                        append_to_chat("system", f"   • Text preview: {text_preview[:100]}...")
-                    else:
-                        append_to_chat("system", f"   ⚠️ No text layer found - this is a scanned PDF")
-                
-                if pdf_info and pdf_info.get("is_dealer_app") and pdf_info.get("has_employee_tables"):
-                    append_to_chat("system", "\n📋 DEALER APPLICATION detected!")
-                    append_to_chat("system", f"   Processing page(s): {[p+1 for p in pdf_info['employee_table_pages']]}")
-                    
-                    all_context = []
-                    
-                    # Process each employee table page as an image
-                    for page_num in pdf_info["employee_table_pages"]:
-                        update_status(f"Processing page {page_num + 1} as image (like screenshot)...")
-                        append_to_chat("system", f"📸 Extracting page {page_num + 1} as image for OCR...")
-                        
-                        # Extract page as image (like a pasted screenshot)
-                        page_img = _extract_page_as_image(file_path, page_num)
-                        if page_img:
-                            append_to_chat("system", f"   ✓ Image extracted: {page_img.size[0]}x{page_img.size[1]} pixels")
-                            
-                            # Process using same approach as clipboard paste
-                            result = _process_dealer_app_image(page_img, page_num + 1, append_to_chat, update_status)
-                            
-                            # Store the context
-                            if result['context']:
-                                all_context.append(result['context'])
-                                
-                                # Store extracted employees for direct MVR export (no AI needed!)
-                                if result.get('employees'):
-                                    extracted_employees.clear()
-                                    extracted_employees.extend(result['employees'])
-                                    append_to_chat("system", f"   💾 {len(result['employees'])} employees stored for MVR export")
-                                
-                                # Show summary
-                                append_to_chat("system", f"\n✅ Page {page_num + 1} processed!")
-                                append_to_chat("system", f"   • {len(result['tables'])} table(s) detected")
-                                append_to_chat("system", f"   • {len(result['text'])} chars of text")
-                                if result['checkboxes']:
-                                    checked = len([c for c in result['checkboxes'] if c.get('checked')])
-                                    append_to_chat("system", f"   • {len(result['checkboxes'])} checkboxes ({checked} checked)")
-                        else:
-                            append_to_chat("system", f"   ❌ Failed to extract page {page_num + 1} as image!")
-                    
-                    # Store combined context
-                    if all_context:
-                        full_context = "\n\n".join(all_context)
-                        document_context.append(full_context)
-                        loaded_pdf_paths.append(file_path)
-                        
-                        # Update document context display
-                        if hasattr(outer, '_doc_context_display'):
-                            outer._doc_context_display.configure(state='normal')
-                            outer._doc_context_display.delete('1.0', 'end')
-                            display_text = full_context[:3000] + "..." if len(full_context) > 3000 else full_context
-                            outer._doc_context_display.insert('1.0', display_text)
-                            outer._doc_context_display.configure(state='disabled')
-                        
-                        # === DIRECT DISPLAY: Show extracted data WITHOUT AI ===
-                        append_to_chat("system", "\n" + "="*50)
-                        append_to_chat("system", "📋 EXTRACTED EMPLOYEE DATA (No AI needed)")
-                        append_to_chat("system", "="*50)
-                        
-                        # Display the structured data directly
-                        for ctx in all_context:
-                            # Show each line of context
-                            for line in ctx.split('\n'):
-                                if line.strip() and not line.startswith('---'):
-                                    if 'Employee' in line or 'Person' in line:
-                                        append_to_chat("system", f"👤 {line}")
-                                    elif 'BUSINESS PERSONNEL' in line or 'NON-BUSINESS' in line:
-                                        append_to_chat("system", f"\n📁 {line}")
-                                    elif 'Row' in line and ':' in line:
-                                        append_to_chat("system", f"   {line}")
-                                    elif 'Status=' in line or 'Checkbox' in line:
-                                        append_to_chat("system", f"   {line}")
-                        
-                        append_to_chat("system", "\n" + "="*50)
-                        append_to_chat("system", "⬆️ EMPLOYEE DATA IS SHOWN ABOVE ⬆️")
-                        append_to_chat("system", "❌ DO NOT ask AI to 'list employees' - data is already displayed!")
-                        append_to_chat("system", "✅ Just scroll up to see the extracted employee info.")
-                    
-                    update_status("Dealer application processed - data displayed")
-                    return
-                
                 # ===== REGULAR DOCUMENT HANDLING =====
+                # Note: For dealer applications, use the DealerAppReader tab instead
                 update_status("Extracting text from document...")
                 ocr_engine = settings.get("ocr_engine", "tesseract")
                 
@@ -3154,42 +2452,6 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                     extracted_text = extract_text_from_document(file_path, ocr_engine)
                 
                 if extracted_text and not extracted_text.startswith("Error") and not extracted_text.startswith("Tesseract OCR error") and not extracted_text.startswith("EasyOCR error") and not extracted_text.startswith("Ollama vision error"):
-                    
-                    # ===== CHECK IF SCANNED PDF IS A DEALER APP =====
-                    # If OCR text contains dealer app cues, run specialized processing on page 2
-                    import re
-                    is_scanned_dealer_app = False
-                    for pattern in _DEALER_APP_CUES:
-                        if re.search(pattern, extracted_text):
-                            is_scanned_dealer_app = True
-                            break
-                    
-                    if is_scanned_dealer_app and file_path.lower().endswith('.pdf'):
-                        append_to_chat("system", "\n📋 SCANNED DEALER APPLICATION detected!")
-                        append_to_chat("system", "   Re-processing page 2 with specialized table extraction...")
-                        
-                        # Process page 2 with the dealer app method
-                        page_img = _extract_page_as_image(file_path, 1)  # Page 2 = index 1
-                        if page_img:
-                            append_to_chat("system", f"   ✓ Page 2 image: {page_img.size[0]}x{page_img.size[1]} pixels")
-                            
-                            result = _process_dealer_app_image(page_img, 2, append_to_chat, update_status)
-                            
-                            if result.get('employees'):
-                                extracted_employees.clear()
-                                extracted_employees.extend(result['employees'])
-                                append_to_chat("system", f"   💾 {len(result['employees'])} employees stored for MVR export")
-                            
-                            if result.get('context'):
-                                document_context.append(result['context'])
-                                loaded_pdf_paths.append(file_path)
-                                
-                                append_to_chat("system", f"\n✅ Dealer application processed!")
-                                append_to_chat("system", f"   💡 Click 'Extract MVR → MVR Runner' to export employees")
-                                update_status("Dealer application processed - ready for MVR export")
-                                return
-                        else:
-                            append_to_chat("system", "   ⚠️ Could not extract page 2 image, using generic OCR")
                     
                     # Clean OCR text and store in document context (don't display in input)
                     cleaned_text = _clean_ocr_text(extracted_text)
@@ -3398,6 +2660,123 @@ Do NOT skip the state field if you see ANY text in the STATE column.
             def process_clipboard_image():
                 try:
                     update_status("Processing image from clipboard...")
+                    
+                    # Option 1: Use Ollama Vision Model for direct extraction (most accurate)
+                    use_vision_model = settings.get("ocr_engine") == "ollama_vision"
+                    if use_vision_model and ollama_connected:
+                        try:
+                            vision_model = settings.get("vision_model", "llava")
+                            append_to_chat("system", f"👁️ Using Ollama Vision Model ({vision_model}) to extract employee data...")
+                            
+                            # Convert image to base64
+                            import base64
+                            from io import BytesIO
+                            img_bytes = BytesIO()
+                            clipboard_image.save(img_bytes, format='PNG')
+                            img_base64 = base64.b64encode(img_bytes.getvalue()).decode('utf-8')
+                            
+                            # Create a detailed prompt for vision model
+                            vision_prompt = """Extract employee information from this table image. 
+
+Return a JSON array with all employees found. For each employee, extract:
+- name (full name)
+- license_number
+- state (2-letter code)
+- dob (MM/DD/YYYY format)
+- position
+- status (FT or PT - which checkbox is checked in STATUS column)
+- personal_use (Y or N - which checkbox is checked in PERSONAL USE column)
+
+IMPORTANT for checkboxes:
+- STATUS column has two checkboxes: [ ] FT and [ ] PT - only one is checked (marked with X)
+- PERSONAL USE column has two checkboxes: [ ] Y and [ ] N - only one is checked (marked with X)
+- If FT checkbox has X, status = "FT"
+- If PT checkbox has X, status = "PT"
+- If Y checkbox has X, personal_use = "Y"
+- If N checkbox has X, personal_use = "N"
+
+Return ONLY valid JSON array, no other text:
+[
+  {
+    "name": "full name",
+    "license_number": "license number",
+    "state": "2-letter state code",
+    "dob": "MM/DD/YYYY",
+    "position": "job title",
+    "status": "FT or PT",
+    "personal_use": "Y or N"
+  }
+]"""
+                            
+                            # Call Ollama vision API
+                            payload = {
+                                "model": vision_model,
+                                "messages": [
+                                    {
+                                        "role": "user",
+                                        "content": vision_prompt,
+                                        "images": [img_base64]
+                                    }
+                                ],
+                                "stream": False,
+                                "options": {
+                                    "temperature": 0.1,  # Low temperature for accurate extraction
+                                    "num_predict": 1024,
+                                }
+                            }
+                            
+                            response = requests.post(
+                                f"{settings['api_url']}/api/chat",
+                                json=payload,
+                                timeout=120
+                            )
+                            
+                            if response.status_code == 200:
+                                data = response.json()
+                                if "message" in data and "content" in data["message"]:
+                                    vision_result = data["message"]["content"]
+                                    
+                                    # Try to parse JSON from response
+                                    import json
+                                    import re
+                                    
+                                    # Extract JSON array from response
+                                    json_match = re.search(r'\[[\s\S]*\]', vision_result)
+                                    if json_match:
+                                        try:
+                                            employees = json.loads(json_match.group())
+                                            if employees and isinstance(employees, list):
+                                                # Format as readable text for context
+                                                formatted_text = "=== EMPLOYEE DATA (from Vision Model) ===\n\n"
+                                                for i, emp in enumerate(employees, 1):
+                                                    formatted_text += f"Employee {i}:\n"
+                                                    formatted_text += f"  Name: {emp.get('name', 'N/A')}\n"
+                                                    formatted_text += f"  License: {emp.get('license_number', 'N/A')}\n"
+                                                    formatted_text += f"  State: {emp.get('state', 'N/A')}\n"
+                                                    formatted_text += f"  DOB: {emp.get('dob', 'N/A')}\n"
+                                                    formatted_text += f"  Position: {emp.get('position', 'N/A')}\n"
+                                                    formatted_text += f"  Status: {emp.get('status', 'N/A')}\n"
+                                                    formatted_text += f"  Personal Use: {emp.get('personal_use', 'N/A')}\n\n"
+                                                
+                                                # Add to document context
+                                                document_context.append(formatted_text)
+                                                
+                                                # Display in chat
+                                                append_to_chat("system", formatted_text)
+                                                append_to_chat("system", f"✅ Successfully extracted {len(employees)} employee(s) using Vision Model")
+                                                update_status(f"Ready - {len(employees)} employee(s) extracted")
+                                                
+                                                # Store for MVR extraction
+                                                extracted_employees.extend(employees)
+                                                return
+                                        except json.JSONDecodeError:
+                                            append_to_chat("system", "⚠️ Vision model response was not valid JSON, falling back to OCR...")
+                                    else:
+                                        append_to_chat("system", "⚠️ No JSON found in vision model response, falling back to OCR...")
+                        except Exception as e:
+                            append_to_chat("system", f"⚠️ Vision model error: {str(e)}, falling back to OCR...")
+                    
+                    # Option 2: Fall back to OCR + OpenCV checkbox detection (existing method)
                     
                     # Import numpy - check if available
                     try:
@@ -3678,16 +3057,443 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                     # Combine both OCR results
                     extracted_text = combine_ocr_results(easyocr_text, tesseract_text)
                     
+                    # ===== CHECKBOX DETECTION FOR CLIPBOARD IMAGES =====
+                    checkbox_info = ""
+                    detected_checkboxes = []
+                    try:
+                        import cv2
+                        import numpy as np
+                        
+                        append_to_chat("system", "☑️ Running checkbox detection on pasted image...")
+                        
+                        # Convert PIL image to OpenCV format
+                        img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+                        
+                        # Binary threshold
+                        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+                        
+                        # Find contours
+                        contours, _ = cv2.findContours(thresh, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+                        
+                        # Checkbox detection parameters
+                        img_height, img_width = gray.shape
+                        min_size = max(10, int(min(img_width, img_height) * 0.01))  # 1% of smaller dimension
+                        max_size = min(200, int(max(img_width, img_height) * 0.1))  # 10% of larger dimension
+                        
+                        for cnt in contours:
+                            x, y, box_w, box_h = cv2.boundingRect(cnt)
+                            
+                            # Filter by size
+                            if not (min_size < box_w < max_size and min_size < box_h < max_size):
+                                continue
+                            
+                            # Filter by aspect ratio (checkboxes are roughly square)
+                            aspect_ratio = box_w / float(box_h)
+                            if not (0.7 < aspect_ratio < 1.4):
+                                continue
+                            
+                            # Check fill ratio to determine if checked
+                            roi = gray[y:y+box_h, x:x+box_w]
+                            if roi.size == 0:
+                                continue
+                            
+                            margin = max(2, int(box_w * 0.15))
+                            inner = roi[margin:-margin, margin:-margin] if margin * 2 < min(box_w, box_h) else roi
+                            
+                            if inner.size == 0:
+                                continue
+                            
+                            dark_pixels = np.sum(inner < 128)
+                            fill_ratio = dark_pixels / inner.size
+                            
+                            # Determine if checked (X marks have ~5-15% fill, filled ~20%+)
+                            is_checked = fill_ratio > 0.04
+                            
+                            detected_checkboxes.append({
+                                'x': x, 'y': y, 'width': box_w, 'height': box_h,
+                                'checked': is_checked, 'fill_ratio': round(fill_ratio, 3)
+                            })
+                        
+                        # Sort by position
+                        detected_checkboxes.sort(key=lambda c: (c['y'] // 30, c['x']))
+                        
+                        # Remove duplicate/near-duplicate checkboxes (same position within 5 pixels)
+                        if detected_checkboxes:
+                            deduplicated = []
+                            for cb in detected_checkboxes:
+                                is_duplicate = False
+                                for existing in deduplicated:
+                                    if abs(cb['x'] - existing['x']) < 5 and abs(cb['y'] - existing['y']) < 5:
+                                        # Keep the one with higher fill ratio (more likely to be correct)
+                                        if cb['fill_ratio'] > existing['fill_ratio']:
+                                            deduplicated.remove(existing)
+                                            deduplicated.append(cb)
+                                        is_duplicate = True
+                                        break
+                                if not is_duplicate:
+                                    deduplicated.append(cb)
+                            detected_checkboxes = deduplicated
+                        
+                        if detected_checkboxes:
+                            checked_list = [c for c in detected_checkboxes if c['checked']]
+                            unchecked_list = [c for c in detected_checkboxes if not c['checked']]
+                            append_to_chat("system", f"✓ Found {len(detected_checkboxes)} checkboxes: {len(checked_list)} checked, {len(unchecked_list)} unchecked")
+                            
+                            # Debug: Show first few checkboxes with their positions
+                            append_to_chat("system", f"🔍 Checkbox positions (first 10):")
+                            for i, cb in enumerate(detected_checkboxes[:10]):
+                                status = "☑ CHECKED" if cb['checked'] else "☐ empty"
+                                append_to_chat("system", f"  #{i+1}: X={cb['x']}, Y={cb['y']}, fill={cb['fill_ratio']:.1%} → {status}")
+                            
+                            # Group checkboxes by row (Y position)
+                            rows_of_checkboxes = {}
+                            y_tolerance = 25
+                            for cb in detected_checkboxes:
+                                row_key = cb['y'] // y_tolerance
+                                if row_key not in rows_of_checkboxes:
+                                    rows_of_checkboxes[row_key] = []
+                                rows_of_checkboxes[row_key].append(cb)
+                            
+                            # Create human-readable checkbox mapping with employee numbers
+                            checkbox_lines = []
+                            checkbox_lines.append("=" * 70)
+                            checkbox_lines.append("✅ CHECKBOX VALUES (ACCURATE - from image analysis)")
+                            checkbox_lines.append("=" * 70)
+                            checkbox_lines.append("CRITICAL: Use these values for STATUS and PERSONAL_USE fields!")
+                            checkbox_lines.append("IGNORE any OCR text in STATUS/USE columns - OCR cannot read checkboxes!")
+                            checkbox_lines.append("")
+                            checkbox_lines.append("IMPORTANT: Checkboxes are listed in ROW ORDER (top to bottom).")
+                            checkbox_lines.append("First checkbox row = First employee, Second checkbox row = Second employee, etc.")
+                            checkbox_lines.append("")
+                            
+                            # Map checkboxes to employee rows (by Y position)
+                            row_mapping = {}
+                            employee_num = 1
+                            
+                            for row_key in sorted(rows_of_checkboxes.keys()):
+                                row_cbs = sorted(rows_of_checkboxes[row_key], key=lambda c: c['x'])
+                                
+                                if len(row_cbs) < 2:
+                                    continue  # Skip rows with too few checkboxes
+                                
+                                # Group checkboxes that are close together (same cell)
+                                # Checkboxes in the same cell are typically within 50-100 pixels of each other
+                                # The gap between cells (STATUS vs PERSONAL USE) is much larger (200+ pixels)
+                                checkbox_groups = []
+                                current_group = [row_cbs[0]]
+                                
+                                # Debug: Show raw checkbox positions for this row
+                                row_debug = f"🔍 Row Y≈{row_key * y_tolerance}: {len(row_cbs)} checkboxes at X="
+                                row_debug += ", ".join([f"{cb['x']} ({'☑' if cb['checked'] else '☐'})" for cb in row_cbs])
+                                append_to_chat("system", row_debug)
+                                
+                                for i in range(1, len(row_cbs)):
+                                    gap = row_cbs[i]['x'] - row_cbs[i-1]['x']
+                                    # If gap is small (< 100px), it's the same cell/group
+                                    if gap < 100:
+                                        current_group.append(row_cbs[i])
+                                    else:
+                                        # Large gap = new cell/group
+                                        checkbox_groups.append(current_group)
+                                        current_group = [row_cbs[i]]
+                                
+                                # Add the last group
+                                if current_group:
+                                    checkbox_groups.append(current_group)
+                                
+                                # Debug: Show how checkboxes were grouped
+                                group_debug = f"  → Grouped into {len(checkbox_groups)} cell(s): "
+                                for g_idx, group in enumerate(checkbox_groups):
+                                    group_x = [f"X={cb['x']} {'☑' if cb['checked'] else '☐'}" for cb in group]
+                                    group_debug += f"Cell{g_idx+1}[{', '.join(group_x)}] "
+                                append_to_chat("system", group_debug)
+                                
+                                # Now identify STATUS and PERSONAL USE groups
+                                # STATUS group is typically first (left side), PERSONAL USE is second (right side)
+                                status_boxes = []
+                                personal_boxes = []
+                                
+                                if len(checkbox_groups) >= 2:
+                                    # First group = STATUS (FT/PT), Second group = PERSONAL USE (Y/N)
+                                    status_boxes = sorted(checkbox_groups[0], key=lambda c: c['x'])
+                                    personal_boxes = sorted(checkbox_groups[1], key=lambda c: c['x'])
+                                    append_to_chat("system", f"  → STATUS cell: {len(status_boxes)} boxes, PERSONAL cell: {len(personal_boxes)} boxes")
+                                elif len(checkbox_groups) == 1:
+                                    # Only one group - might be all STATUS or all PERSONAL
+                                    # If it has 4 checkboxes, split in half
+                                    if len(checkbox_groups[0]) >= 4:
+                                        status_boxes = sorted(checkbox_groups[0][:2], key=lambda c: c['x'])
+                                        personal_boxes = sorted(checkbox_groups[0][2:], key=lambda c: c['x'])
+                                        append_to_chat("system", f"  → Split single group: STATUS={len(status_boxes)} boxes, PERSONAL={len(personal_boxes)} boxes")
+                                    elif len(checkbox_groups[0]) == 2:
+                                        # Only 2 checkboxes - assume STATUS (FT/PT)
+                                        status_boxes = sorted(checkbox_groups[0], key=lambda c: c['x'])
+                                        append_to_chat("system", f"  → Single group with 2 boxes: Assuming STATUS only")
+                                else:
+                                    # Fallback: use original logic if grouping failed
+                                    if len(row_cbs) >= 4:
+                                        status_boxes = row_cbs[:2]
+                                        personal_boxes = row_cbs[2:]
+                                        append_to_chat("system", f"  → Fallback: First 2 = STATUS, Last 2 = PERSONAL")
+                                    elif len(row_cbs) == 2:
+                                        status_boxes = row_cbs
+                                        append_to_chat("system", f"  → Fallback: Only 2 boxes, assuming STATUS")
+                                
+                                # Sort each group by X position
+                                status_boxes.sort(key=lambda c: c['x'])
+                                personal_boxes.sort(key=lambda c: c['x'])
+                                
+                                # Determine STATUS: FT (first checkbox) or PT (second checkbox)
+                                # IMPORTANT: Only one should be checked - if both are checked, it's an error
+                                status = ""
+                                if len(status_boxes) >= 2:
+                                    ft_checked = status_boxes[0]['checked']
+                                    pt_checked = status_boxes[1]['checked']
+                                    if ft_checked and not pt_checked:
+                                        status = "FT"
+                                    elif pt_checked and not ft_checked:
+                                        status = "PT"
+                                    elif ft_checked and pt_checked:
+                                        # Both checked - this shouldn't happen, but prioritize FT
+                                        status = "FT"
+                                        append_to_chat("system", f"⚠️ Row Y≈{row_key * y_tolerance}: Both FT and PT checked! Using FT.")
+                                elif len(status_boxes) == 1:
+                                    if status_boxes[0]['checked']:
+                                        status = "FT"  # Assume FT if only one checkbox in STATUS column
+                                
+                                # Determine PERSONAL_USE: Y (first checkbox) or N (second checkbox)
+                                # IMPORTANT: Only one should be checked
+                                personal_use = ""
+                                if len(personal_boxes) >= 2:
+                                    y_checked = personal_boxes[0]['checked']
+                                    n_checked = personal_boxes[1]['checked']
+                                    if y_checked and not n_checked:
+                                        personal_use = "Y"
+                                    elif n_checked and not y_checked:
+                                        personal_use = "N"
+                                    elif y_checked and n_checked:
+                                        # Both checked - this shouldn't happen, but prioritize Y
+                                        personal_use = "Y"
+                                        append_to_chat("system", f"⚠️ Row Y≈{row_key * y_tolerance}: Both Y and N checked! Using Y.")
+                                elif len(personal_boxes) == 1:
+                                    if personal_boxes[0]['checked']:
+                                        personal_use = "Y"  # Assume Y if only one checkbox in PERSONAL column
+                                
+                                # Only add if we have at least STATUS or PERSONAL_USE
+                                if status or personal_use:
+                                    row_y = row_key * y_tolerance
+                                    row_mapping[row_y] = {"status": status, "personal_use": personal_use}
+                                    
+                                    # Debug info - show detailed checkbox states
+                                    debug_info = f"  [Row Y≈{row_y}: {len(status_boxes)} STATUS boxes, {len(personal_boxes)} PERSONAL boxes]"
+                                    if status_boxes:
+                                        ft_state = "☑ CHECKED" if status_boxes[0]['checked'] else "☐ empty"
+                                        pt_state = "☑ CHECKED" if len(status_boxes) > 1 and status_boxes[1]['checked'] else "☐ empty"
+                                        debug_info += f" STATUS: {ft_state}FT (X={status_boxes[0]['x']}), {pt_state}PT (X={status_boxes[1]['x'] if len(status_boxes) > 1 else 'N/A'})"
+                                    if personal_boxes:
+                                        y_state = "☑ CHECKED" if personal_boxes[0]['checked'] else "☐ empty"
+                                        n_state = "☑ CHECKED" if len(personal_boxes) > 1 and personal_boxes[1]['checked'] else "☐ empty"
+                                        debug_info += f" | PERSONAL: {y_state}Y (X={personal_boxes[0]['x']}), {n_state}N (X={personal_boxes[1]['x'] if len(personal_boxes) > 1 else 'N/A'})"
+                                    
+                                    checkbox_lines.append(f"Employee #{employee_num}: STATUS = \"{status}\", PERSONAL_USE = \"{personal_use}\"{debug_info}")
+                                    employee_num += 1
+                                elif len(row_cbs) >= 2:
+                                    # Fallback: if we can't determine, show what we found
+                                    row_y = row_key * y_tolerance
+                                    cb_states = ", ".join([f"X={cb['x']} {'☑' if cb['checked'] else '☐'}" for cb in row_cbs])
+                                    checkbox_lines.append(f"Employee #{employee_num}: [Unclear] {cb_states}")
+                                    employee_num += 1
+                            
+                            checkbox_lines.append("")
+                            checkbox_lines.append("=" * 70)
+                            
+                            checkbox_info = "\n" + "\n".join(checkbox_lines) + "\n"
+                            append_to_chat("system", checkbox_info)
+                            
+                            # Store row mapping for later use
+                            checkbox_row_mapping = row_mapping
+                    except Exception as e:
+                        append_to_chat("system", f"Checkbox detection error: {str(e)}")
+                        import traceback
+                        append_to_chat("system", f"Traceback: {traceback.format_exc()[:300]}")
+                    
                     # Update UI
                     def update_ui():
                         # Capture extracted_text from outer scope
-                        nonlocal extracted_text
+                        nonlocal extracted_text, checkbox_info
                         if extracted_text and extracted_text.strip():
                             # Clean OCR text to fix common issues (dates, checkbox marks)
                             cleaned_text = _clean_ocr_text(extracted_text)
+                            
+                            # Remove checkbox garbage from STATUS and PERSONAL USE columns
+                            # Patterns like "IFT Dpt", "Dx DN", "IFt EPt", "Dx AN" should be removed
+                            # These are OCR misreadings of checkboxes
+                            checkbox_garbage_patterns = [
+                                r'\b[IXEFD]FT\s*[DP]?[pt]?\b',  # IFT, EFT, DPT, etc.
+                                r'\b[IXEFD]PT\s*[DP]?[pt]?\b',  # IPT, EPT, etc.
+                                r'\bDx\s*[DNAN]N?\b',  # Dx DN, Dx AN, etc.
+                                r'\b[IXEFD]\s*[DN]\b',  # I N, E N, D N, etc.
+                                r'\b[IXEFD][pt]\s*[DP]?[pt]?\b',  # Ipt, Ept, etc.
+                                r'\bIFT\s+Dpt\b',  # IFT Dpt
+                                r'\bIFt\s+EPt\b',  # IFt EPt
+                                r'\bDx\s+DN\b',  # Dx DN
+                                r'\bDx\s+AN\b',  # Dx AN
+                                r'\b[IXEFD]FT\s+[DP][pt]\b',  # IFT Dpt, EFT Dpt, etc.
+                                r'\b[IXEFD][pt]\s+[EP][pt]\b',  # IFt EPt, etc.
+                            ]
+                            for pattern in checkbox_garbage_patterns:
+                                cleaned_text = re.sub(pattern, '', cleaned_text, flags=re.IGNORECASE)
+                            
+                            # Also remove any standalone words that look like checkbox garbage
+                            # Remove words that are 2-4 chars and contain only I, F, T, P, E, D, X, N, A, p, t, x
+                            checkbox_chars = set('IFTEPTDNAXpt')
+                            lines = cleaned_text.split('\n')
+                            cleaned_lines = []
+                            for line in lines:
+                                words = line.split()
+                                cleaned_words = []
+                                for word in words:
+                                    # If word is short and contains only checkbox-like characters, it's probably garbage
+                                    if 2 <= len(word) <= 4 and all(c.upper() in checkbox_chars for c in word):
+                                        # Skip it unless it's a valid state code or known good word
+                                        if word.upper() not in ['FT', 'PT', 'Y', 'N', 'CA', 'IL', 'NY', 'TX', 'FL', 'OH', 'PA', 'GA', 'NC', 'MI', 'NJ', 'VA', 'WA', 'AZ', 'MA', 'TN', 'IN', 'MO', 'MD', 'WI', 'CO', 'MN', 'SC', 'AL', 'LA', 'KY', 'OR', 'OK', 'CT', 'IA', 'UT', 'AR', 'NV', 'MS', 'KS', 'NM', 'NE', 'WV', 'ID', 'HI', 'NH', 'ME', 'RI', 'MT', 'DE', 'SD', 'ND', 'AK', 'DC', 'VT', 'WY']:
+                                            continue  # Skip this word
+                                    cleaned_words.append(word)
+                                cleaned_lines.append(' '.join(cleaned_words))
+                            cleaned_text = '\n'.join(cleaned_lines)
+                            
+                            # Clean up multiple spaces
+                            cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+                            cleaned_text = re.sub(r'\n\s*\n', '\n', cleaned_text)
+                            
+                            # Prepend checkbox info prominently at the top with clear instructions
+                            if checkbox_info:
+                                instruction = "=" * 70 + "\n"
+                                instruction += "⚠️ CRITICAL INSTRUCTION FOR AI:\n"
+                                instruction += "The STATUS and PERSONAL_USE columns in the OCR text below contain\n"
+                                instruction += "GARBAGE from OCR misreading checkboxes (like 'IFT Dpt', 'Dx DN').\n"
+                                instruction += "IGNORE all text in STATUS and PERSONAL_USE columns!\n"
+                                instruction += "ONLY use the checkbox values shown above in the CHECKBOX VALUES section!\n"
+                                instruction += "=" * 70 + "\n\n"
+                                cleaned_text = checkbox_info + "\n" + instruction + cleaned_text
+                            
+                            # Add a clear header to help AI recognize this as employee data
+                            employee_header = "\n" + "=" * 70 + "\n"
+                            employee_header += "📋 EMPLOYEE TABLE DATA\n"
+                            employee_header += "=" * 70 + "\n"
+                            employee_header += "This document contains an employee table with the following columns:\n"
+                            employee_header += "- NAME: Employee full name\n"
+                            employee_header += "- LICENSE #: Driver's license number\n"
+                            employee_header += "- STATE: 2-letter state code (CA, IL, etc.)\n"
+                            employee_header += "- DOB: Date of birth (MM/DD/YYYY format)\n"
+                            employee_header += "- POSITION: Job title/position\n"
+                            employee_header += "- STATUS: FT (Full-Time) or PT (Part-Time) - use CHECKBOX VALUES above!\n"
+                            employee_header += "- PERSONAL USE: Y (Yes) or N (No) - use CHECKBOX VALUES above!\n"
+                            employee_header += "=" * 70 + "\n\n"
+                            cleaned_text = employee_header + cleaned_text
+                            
                             document_context.append(cleaned_text)
+                            
+                            # Parse employee data from OCR text and checkbox mapping
+                            # This ensures extracted_employees is populated so AI can see it
+                            try:
+                                # Get checkbox row mapping (if available)
+                                checkbox_row_mapping = locals().get('checkbox_row_mapping', {})
+                                
+                                # Parse OCR text to extract employee rows
+                                # Look for lines with dates (DOB) - these are employee rows
+                                ocr_lines = extracted_text.split('\n')
+                                state_codes = ["AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"]
+                                
+                                employee_rows = []
+                                for line in ocr_lines:
+                                    line = line.strip()
+                                    if not line or len(line) < 5:
+                                        continue
+                                    
+                                    # Skip header lines
+                                    if any(header in line.upper() for header in ['NAME', 'LICENSE', 'STATE', 'DOB', 'POSITION', 'STATUS', 'PERSONAL', 'USE']):
+                                        continue
+                                    
+                                    # Look for date pattern (DOB) - indicates employee row
+                                    dob_match = re.search(r'\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\b', line)
+                                    if dob_match:
+                                        employee_rows.append((len(employee_rows), line))  # Store with index
+                                
+                                # Parse each employee row and match with checkbox values
+                                for emp_idx, line in employee_rows:
+                                    words = line.split()
+                                    if len(words) < 3:
+                                        continue
+                                    
+                                    emp_data = {
+                                        'name': '',
+                                        'license': '',
+                                        'state': '',
+                                        'dob': '',
+                                        'position': '',
+                                        'status': '',
+                                        'personal_use': ''
+                                    }
+                                    
+                                    # Extract DOB
+                                    dob_match = re.search(r'\b(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})\b', line)
+                                    if dob_match:
+                                        emp_data['dob'] = dob_match.group(1)
+                                    
+                                    # Extract fields from words
+                                    name_parts = []
+                                    for word in words:
+                                        word_clean = word.strip('.,')
+                                        word_upper = word_clean.upper()
+                                        
+                                        # State code
+                                        if word_upper in state_codes:
+                                            emp_data['state'] = word_upper
+                                        # License number (alphanumeric, 6+ chars)
+                                        elif re.match(r'^[A-Z0-9]{6,}$', word_upper):
+                                            if not emp_data['license']:
+                                                emp_data['license'] = word_clean
+                                        # Date (skip, already extracted)
+                                        elif re.match(r'^\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}$', word_clean):
+                                            pass
+                                        # Name (multi-word or single word with letters)
+                                        elif len(word_clean) >= 2 and any(c.isalpha() for c in word_clean):
+                                            name_parts.append(word_clean)
+                                        # Position (short words that might be job titles)
+                                        elif len(word_clean) >= 2 and len(word_clean) <= 10:
+                                            if not emp_data['position']:
+                                                emp_data['position'] = word_clean
+                                    
+                                    if name_parts:
+                                        emp_data['name'] = ' '.join(name_parts)
+                                    
+                                    # Match checkbox values by employee index
+                                    # Checkbox rows are in order, so match by index
+                                    if checkbox_row_mapping:
+                                        checkbox_rows = sorted(checkbox_row_mapping.keys())
+                                        if emp_idx < len(checkbox_rows):
+                                            row_y = checkbox_rows[emp_idx]
+                                            if row_y in checkbox_row_mapping:
+                                                emp_data['status'] = checkbox_row_mapping[row_y].get('status', '')
+                                                emp_data['personal_use'] = checkbox_row_mapping[row_y].get('personal_use', '')
+                                    
+                                    # Only add if we have at least name and DOB
+                                    if emp_data['name'] and emp_data['dob']:
+                                        extracted_employees.append(emp_data)
+                                        append_to_chat("system", f"📋 Parsed employee: {emp_data['name']} | {emp_data['state']} | {emp_data['dob']} | Status: {emp_data['status']} | Personal Use: {emp_data['personal_use']}")
+                                
+                                if extracted_employees:
+                                    append_to_chat("system", f"✅ Extracted {len(extracted_employees)} employee(s) from OCR text")
+                            except Exception as e:
+                                # Don't fail if parsing doesn't work - AI can still parse from text
+                                append_to_chat("system", f"⚠️ Employee parsing error (AI can still extract from text): {str(e)}")
+                            
                             # Use cleaned version for all display purposes
-                            msg = f"Image processed from clipboard ({len(cleaned_text)} characters extracted)"
+                            msg = f"Image processed from clipboard ({len(extracted_text)} characters extracted)"
+                            if detected_checkboxes:
+                                msg += f"\n✓ Detected {len(detected_checkboxes)} checkboxes ({len([c for c in detected_checkboxes if c['checked']])} checked)"
                             if tables:
                                 msg += f"\nFound {len(tables)} table(s)"
                                 for table_info in tables:
@@ -3698,24 +3504,20 @@ Do NOT skip the state field if you see ANY text in the STATE column.
                             # Display the extracted text so AI can see it
                             append_to_chat("system", msg)
                             
-                            # Check if checkbox information is present and add context (use cleaned text)
-                            checkbox_note = ""
-                            if "FT" in cleaned_text or "PT" in cleaned_text:
-                                checkbox_note += "\nNote: STATUS checkboxes detected (FT=Full-Time, PT=Part-Time). "
-                            if (" Y " in cleaned_text or " N " in cleaned_text or 
-                                cleaned_text.startswith("Y ") or cleaned_text.startswith("N ") or
-                                " Y\n" in cleaned_text or " N\n" in cleaned_text):
-                                checkbox_note += "PERSONAL USE checkboxes detected (Y=Yes, N=No)."
+                            # Show checkbox info prominently if detected
+                            if checkbox_info:
+                                append_to_chat("system", "\n" + "="*60)
+                                append_to_chat("system", "✅ CHECKBOX VALUES DETECTED (Use these for STATUS and PERSONAL_USE):")
+                                append_to_chat("system", checkbox_info)
+                                append_to_chat("system", "="*60)
                             
                             # Show extracted text (truncate if very long, but show enough for context)
-                            display_text = cleaned_text
+                            display_text = extracted_text
                             if len(display_text) > 2000:
                                 display_text = display_text[:2000] + "\n... (truncated, full text available for MVR extraction)"
                             
-                            append_to_chat("system", f"Extracted text:\n{display_text}")
-                            if checkbox_note:
-                                append_to_chat("system", checkbox_note.strip())
-                            update_status("Ready - Image processed")
+                            append_to_chat("system", f"\nExtracted text:\n{display_text}")
+                            update_status("Ready - Image processed with checkbox detection")
                         else:
                             # Provide more detailed error message
                             error_details = []

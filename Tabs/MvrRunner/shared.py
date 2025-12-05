@@ -20,6 +20,11 @@ except Exception as e:
     sync_playwright = None  # type: ignore
 
 try:
+    import sys
+    import os
+    _legacy_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "legacy")
+    if _legacy_path not in sys.path:
+        sys.path.insert(0, _legacy_path)
     from legacy_form_helpers import set_select_dropdown_value, fill_text_input
 except Exception as e:
     _IMPORT_ERRORS.append(("legacy_form_helpers", str(e)))
@@ -51,7 +56,7 @@ except Exception as e:
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(_THIS_DIR)
 _MVR_SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "mvr_settings.json")
-_MVR_UI_SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "mvr_ui_settings.json")
+_MVR_UI_SETTINGS_PATH = os.path.join(_PROJECT_ROOT, "config", "mvr_ui_settings.json")
 
 # Display size presets (similar to Binder Splitter)
 _SIZE_PRESETS = {

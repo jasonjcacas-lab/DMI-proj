@@ -4,6 +4,11 @@ This script shows how to use the helper functions to interact with legacy web fo
 """
 
 from playwright.sync_api import sync_playwright
+import sys
+import os
+_legacy_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "legacy")
+if _legacy_path not in sys.path:
+    sys.path.insert(0, _legacy_path)
 from legacy_form_helpers import (
     set_select_dropdown_value,
     fill_text_input,

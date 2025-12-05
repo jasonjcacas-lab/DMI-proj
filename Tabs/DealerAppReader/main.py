@@ -132,28 +132,73 @@ def _ocr_page(file_path: str, page_num: int) -> List[Dict]:
         
         results = []
         
-        # Use Tesseract (faster)
+        # Try Tesseract first (faster, better positioned data)
         if _TESSERACT_AVAILABLE:
-            data = pytesseract.image_to_data(img, lang='eng', output_type=pytesseract.Output.DICT)
-            
-            for i in range(len(data['text'])):
-                text = data['text'][i]
-                conf = data['conf'][i]
+            try:
+                data = pytesseract.image_to_data(img, lang='eng', output_type=pytesseract.Output.DICT)
                 
-                if text and text.strip() and conf > 30:
-                    results.append({
-                        'text': text.strip(),
-                        'x': data['left'][i],
-                        'y': data['top'][i],
-                        'width': data['width'][i],
-                        'height': data['height'][i],
-                        'conf': conf
-                    })
+                for i in range(len(data['text'])):
+                    text = data['text'][i]
+                    conf = data['conf'][i]
+                    
+                    if text and text.strip() and conf > 30:
+                        results.append({
+                            'text': text.strip(),
+                            'x': data['left'][i],
+                            'y': data['top'][i],
+                            'width': data['width'][i],
+                            'height': data['height'][i],
+                            'conf': conf
+                        })
+                
+                if results:
+                    return results
+            except Exception as e:
+                print(f"Tesseract OCR error: {e}")
+        
+        # Fallback to EasyOCR if Tesseract failed or not available
+        if _EASYOCR_AVAILABLE:
+            try:
+                import numpy as np
+                img_array = np.array(img)
+                reader = easyocr.Reader(['en'], gpu=False)
+                ocr_result = reader.readtext(img_array, detail=1)
+                
+                for item in ocr_result:
+                    if len(item) >= 2:
+                        bbox = item[0]  # Bounding box coordinates
+                        text = item[1]  # Text
+                        conf = item[2] if len(item) > 2 else 0.5  # Confidence
+                        
+                        if text and text.strip() and conf > 0.3:
+                            # Calculate center and dimensions from bbox
+                            x_coords = [p[0] for p in bbox]
+                            y_coords = [p[1] for p in bbox]
+                            x = min(x_coords)
+                            y = min(y_coords)
+                            width = max(x_coords) - x
+                            height = max(y_coords) - y
+                            
+                            results.append({
+                                'text': text.strip(),
+                                'x': x,
+                                'y': y,
+                                'width': width,
+                                'height': height,
+                                'conf': conf * 100
+                            })
+                
+                if results:
+                    return results
+            except Exception as e:
+                print(f"EasyOCR error: {e}")
         
         return results
         
     except Exception as e:
         print(f"OCR error: {e}")
+        import traceback
+        traceback.print_exc()
         return []
 
 
@@ -239,8 +284,22 @@ def _parse_employee_tables(ocr_items: List[Dict], img_height: int = 2000) -> Dic
         if not any(any(c.isalpha() for c in t) for t in texts):
             continue
         
-        # Try to parse as employee record
-        record = _parse_row_as_employee(texts)
+        # Apply state corrections to individual text items (only 2-char items that might be states)
+        # This fixes OCR errors like "1L" → "IL" without breaking date formats
+        texts_corrected = []
+        for text_item in texts:
+            # Only apply state corrections to 2-character items (likely state codes)
+            if len(text_item.strip()) == 2:
+                corrected = _normalize_state(text_item)
+                if corrected:
+                    texts_corrected.append(corrected)
+                else:
+                    texts_corrected.append(text_item)  # Keep original if not a state
+            else:
+                texts_corrected.append(text_item)  # Keep all other items as-is (preserves dates)
+        
+        # Try to parse as employee record (use corrected texts)
+        record = _parse_row_as_employee(texts_corrected)
         if record:
             # Determine which section this belongs to
             if non_business_header_y and y > non_business_header_y:
@@ -251,12 +310,234 @@ def _parse_employee_tables(ocr_items: List[Dict], img_height: int = 2000) -> Dic
     return result
 
 
+def _normalize_date(date_str: str) -> str:
+    """
+    Normalize date string to MM/DD/YYYY format, handling OCR errors.
+    
+    Examples:
+    - "2/11/1995" → "02/11/1995"
+    - "21/11/995" → "02/11/1995" (OCR error: "2" and "1" combined, year truncated)
+    - "2111/995" → "02/11/1995" (OCR error: missing slashes)
+    - "2/11/95" → "02/11/1995" (2-digit year)
+    """
+    if not date_str:
+        return ""
+    
+    # Remove trailing underscores and clean
+    date_str = date_str.strip().rstrip('_').rstrip()
+    
+    # Handle dates where slash is misread (e.g., "2111/995" → "2/11/1995")
+    # Pattern: 3-4 digits, then /, then 3-4 digits (year)
+    slash_misread = re.match(r'^(\d{3,4})/(\d{3,4})$', date_str)
+    if slash_misread:
+        first_part = slash_misread.group(1)
+        year_part = slash_misread.group(2)
+        
+        # Try to split first_part into month and day
+        if len(first_part) == 4:
+            # Try 1+2 split (e.g., "2111" → "2" + "11")
+            if first_part[0] in '12' and 1 <= int(first_part[1:3]) <= 31:
+                month = first_part[0]
+                day = first_part[1:3]
+            # Try 2+2 split (e.g., "1211" → "12" + "11")
+            elif 1 <= int(first_part[0:2]) <= 12 and 1 <= int(first_part[2:4]) <= 31:
+                month = first_part[0:2]
+                day = first_part[2:4]
+            else:
+                # Default: assume 1+2 split
+                month = first_part[0]
+                day = first_part[1:3]
+        elif len(first_part) == 3:
+            month = first_part[0]
+            day = first_part[1:3]
+        else:
+            return date_str  # Can't parse
+        
+        # Fix year (add missing "1" or "19" prefix if truncated)
+        if len(year_part) == 3:
+            # "995" → "1995"
+            year = "1" + year_part
+        elif len(year_part) == 2:
+            # "95" → "1995" (if > 50) or "2095" (if <= 50)
+            year = "19" + year_part if int(year_part) > 50 else "20" + year_part
+        else:
+            year = year_part
+        
+        # Validate and format
+        if 1 <= int(month) <= 12 and 1 <= int(day) <= 31 and 1900 <= int(year) <= 2099:
+            return f"{month.zfill(2)}/{day.zfill(2)}/{year}"
+    
+    # Handle normal date format M/D/YYYY or MM/DD/YYYY
+    # Also handle cases where month is > 12 (OCR combined digits, e.g., "21/11/995")
+    date_match = re.match(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})', date_str)
+    if date_match:
+        month, day, year = date_match.groups()
+        
+        # Fix OCR errors where month is > 12 (e.g., "21/11/995" → month="21" should be "2")
+        # This happens when "2" and "1" are combined
+        month_int = int(month)
+        if month_int > 12:
+            # Try splitting: if month is 21-31, it might be "2" + "1" (day)
+            # But we need to check if day makes sense
+            day_int = int(day)
+            if month_int >= 21 and month_int <= 31 and day_int <= 12:
+                # Swap: "21/11" might be "2/11" with first digit of day combined
+                # Actually, "21/11" is likely "2/11" where "2" and "1" got combined
+                # Split month: take first digit
+                month = str(month_int // 10)  # "21" → "2"
+                # Day stays the same if it's valid
+            elif month_int >= 13 and month_int <= 19:
+                # "13" through "19" might be "1" + "3" (month=1, day starts with 3)
+                # But this is ambiguous, so try first digit
+                month = month[0]
+        
+        # Fix truncated years
+        if len(year) == 3:
+            # "995" → "1995"
+            year = "1" + year
+        elif len(year) == 2:
+            # "95" → "1995" (if > 50) or "2095" (if <= 50)
+            year = "19" + year if int(year) > 50 else "20" + year
+        
+        # Validate
+        month_int = int(month)
+        day_int = int(day)
+        year_int = int(year)
+        if 1 <= month_int <= 12 and 1 <= day_int <= 31 and 1900 <= year_int <= 2099:
+            return f"{month.zfill(2)}/{day.zfill(2)}/{year}"
+    
+    return date_str  # Return original if can't parse
+
+
+def _apply_state_corrections_to_text(text: str) -> str:
+    """
+    Apply state code corrections to entire text (same approach as OllamaTool's _clean_ocr_text).
+    This fixes OCR errors like "1L" → "IL" globally before parsing.
+    """
+    if not text:
+        return text
+    
+    # Comprehensive state code corrections (same as OllamaTool)
+    state_corrections = {
+        # IL (Illinois) - most commonly misread
+        "1L": "IL", "I1": "IL", "|L": "IL", "|1": "IL", "11": "IL",
+        "1l": "IL", "i1": "IL", "|l": "IL", "1|": "IL", "|I": "IL",
+        "IL.": "IL", "IL,": "IL",
+        # Other common misreadings
+        "N1": "NY", "NY.": "NY", "NY,": "NY",
+        "C4": "CA", "CA.": "CA", "CA,": "CA",
+        "P4": "PA", "PA.": "PA", "PA,": "PA",
+        "F1": "FL", "FL.": "FL", "FL,": "FL",
+        "0H": "OH", "OH.": "OH", "OH,": "OH",
+        "M1": "MI", "MI.": "MI", "MI,": "MI",
+        "TX.": "TX", "TX,": "TX",
+    }
+    
+    # Apply corrections using word boundaries (same as OllamaTool)
+    for wrong, correct in state_corrections.items():
+        # Match standalone codes (word boundaries)
+        text = re.sub(r'\b' + re.escape(wrong) + r'\b', correct, text, flags=re.IGNORECASE)
+        # Also match codes that might be part of "STATE" column context
+        text = re.sub(r'\b(STATE|State)\s+' + re.escape(wrong) + r'\b', 
+                     r'\1 ' + correct, text, flags=re.IGNORECASE)
+    
+    return text
+
+
+def _normalize_state(state_str: str) -> str:
+    """
+    Normalize state code, handling OCR errors.
+    
+    Examples:
+    - "IL" → "IL"
+    - "1L" → "IL" (I misread as 1)
+    - "I1" → "IL" (L misread as 1)
+    - "|L" → "IL" (I misread as |)
+    - "1l" → "IL" (lowercase)
+    - "IL." → "IL" (extra period)
+    """
+    if not state_str:
+        return ""
+    
+    # Remove trailing periods, underscores, and clean
+    state_str = state_str.strip().rstrip('._- ').upper()
+    
+    if not state_str:
+        return ""
+    
+    # Valid US state codes
+    valid_states = ['AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY']
+    
+    # Check if it's already a valid state
+    if state_str in valid_states:
+        return state_str
+    
+    # Comprehensive OCR error corrections (especially for IL)
+    ocr_corrections = {
+        # Illinois - most commonly misread
+        '1L': 'IL',   # "I" misread as "1"
+        'I1': 'IL',   # "L" misread as "1"
+        '|L': 'IL',   # "I" misread as "|"
+        '|1': 'IL',   # Both misread
+        '1l': 'IL',   # Lowercase
+        'i1': 'IL',   # Lowercase
+        '|l': 'IL',   # Lowercase
+        '1|': 'IL',   # Alternative
+        '|I': 'IL',   # Alternative
+        'IL.': 'IL',  # Extra period
+        'IL,': 'IL',  # Extra comma
+        # Other common misreadings
+        'N1': 'NY',   # New York - "Y" misread as "1"
+        'NY.': 'NY',  # Extra period
+        'C4': 'CA',   # California - "A" misread as "4"
+        'CA.': 'CA',  # Extra period
+        'P4': 'PA',   # Pennsylvania - "A" misread as "4"
+        'PA.': 'PA',  # Extra period
+        'F1': 'FL',   # Florida - "L" misread as "1"
+        'FL.': 'FL',  # Extra period
+        '0H': 'OH',   # Ohio - "O" misread as "0"
+        'OH.': 'OH',  # Extra period
+        'M1': 'MI',   # Michigan - "I" misread as "1"
+        'MI.': 'MI',  # Extra period
+        'TX.': 'TX',  # Texas - extra period
+        'TX,': 'TX',  # Extra comma
+    }
+    
+    # Try direct OCR correction
+    if state_str in ocr_corrections:
+        return ocr_corrections[state_str]
+    
+    # Try pattern matching for common OCR errors (only if exactly 2 chars)
+    if len(state_str) == 2:
+        # Replace common OCR misreadings: 1→I, |→I, 0→O
+        corrected = state_str.replace('1', 'I').replace('|', 'I').replace('0', 'O')
+        if corrected in valid_states:
+            return corrected
+        
+        # Try reverse: if it looks like IL but with swapped characters
+        # e.g., "L1" might be "IL" with characters swapped
+        if state_str[0] == 'L' and state_str[1] in '1I|':
+            # Could be IL with first char misread
+            if 'I' + state_str[1].replace('1', 'I').replace('|', 'I') in valid_states:
+                return 'IL'
+        
+        # Try if first char is 1/| and second is L
+        if state_str[0] in '1|' and state_str[1] == 'L':
+            return 'IL'
+        
+        # Try if first char is I and second is 1/|
+        if state_str[0] == 'I' and state_str[1] in '1|':
+            return 'IL'
+    
+    return ""
+
+
 def _parse_row_as_employee(texts: List[str]) -> Optional[Dict]:
     """
     Parse a row of OCR texts into an employee record.
     
     Expected columns (approximately):
-    NAME | DOB | LICENSE # | STATE | POSITION | FT/PT | PERSONAL USE | YRS EXP
+    NAME | LICENSE # | STATE | DOB | POSITION | STATUS | PERSONAL USE
     """
     if len(texts) < 2:
         return None
@@ -280,32 +561,96 @@ def _parse_row_as_employee(texts: List[str]) -> Optional[Dict]:
         return None  # Not a valid employee row
     
     # Look for patterns in remaining texts
+    # Process in priority order: DOB first (most reliable), then state, then license
     for text in texts[1:]:
-        text_clean = text.strip()
+        text_clean = text.strip().rstrip('_').rstrip()
         text_upper = text_clean.upper()
         
-        # Date pattern (DOB)
-        if re.match(r'\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}', text_clean):
-            record['dob'] = text_clean
-        # State code (2 letters)
-        elif re.match(r'^[A-Z]{2}$', text_upper) and text_upper in ['AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY']:
-            record['state'] = text_upper
-        # License number (alphanumeric, 5+ chars)
-        elif len(text_clean) >= 5 and re.match(r'^[A-Z0-9]+$', text_upper):
+        # Date pattern (DOB) - try multiple formats (highest priority)
+        if re.search(r'\d[/\-]\d', text_clean) or re.search(r'\d{3,4}/\d{3,4}', text_clean):
+            print(f"[DEBUG] Found potential date: '{text_clean}'")
+            normalized_dob = _normalize_date(text_clean)
+            print(f"[DEBUG] Normalized date '{text_clean}' to '{normalized_dob}'")
+            if normalized_dob and not record['dob']:
+                record['dob'] = normalized_dob
+                print(f"[DEBUG] Set DOB to: {normalized_dob}")
+                continue  # Skip other checks for this text
+        
+        # State code detection - improved to catch IL and other states
+        if not record['state']:
+            # First, try exact 2-character match
+            if len(text_clean) == 2:
+                print(f"[DEBUG] Checking 2-char text for state: '{text_clean}'")
+                normalized_state = _normalize_state(text_clean)
+                print(f"[DEBUG] Normalized '{text_clean}' to '{normalized_state}'")
+                if normalized_state:
+                    print(f"[DEBUG] Found state via exact match: {normalized_state}")
+                    record['state'] = normalized_state
+                    continue  # Found state, skip other checks for this text
+            
+            # If not found, check if text contains a state code pattern
+            # Look for 2-character codes that could be states (including OCR errors)
+            # Pattern: exactly 2 chars of letters, numbers, or | (common OCR error)
+            state_match = re.search(r'\b([A-Z0-9|]{2})\b', text_upper)
+            if state_match:
+                potential_state = state_match.group(1)
+                print(f"[DEBUG] Found potential state in text '{text_clean}': '{potential_state}'")
+                normalized_state = _normalize_state(potential_state)
+                print(f"[DEBUG] Normalized '{potential_state}' to '{normalized_state}'")
+                if normalized_state:
+                    print(f"[DEBUG] Found state via pattern match: {normalized_state}")
+                    record['state'] = normalized_state
+                    continue  # Found state, skip other checks for this text
+        
+        # License number (alphanumeric, 5+ chars, not a date)
+        if not record['license'] and len(text_clean) >= 5 and re.match(r'^[A-Z0-9]+$', text_upper) and not re.search(r'\d[/\-]\d', text_clean):
             record['license'] = text_clean
         # FT/PT status
-        elif text_upper in ['FT', 'PT', 'FULL', 'PART']:
+        elif not record['status'] and text_upper in ['FT', 'PT', 'FULL', 'PART']:
             record['status'] = 'FT' if 'F' in text_upper else 'PT'
         # Personal use Y/N
-        elif text_upper in ['Y', 'N', 'YES', 'NO']:
+        elif not record['personal_use'] and text_upper in ['Y', 'N', 'YES', 'NO']:
             record['personal_use'] = 'Y' if text_upper.startswith('Y') else 'N'
         # Position (common job titles)
-        elif text_upper in ['OWNER', 'SALES', 'MANAGER', 'DRIVER', 'MECHANIC', 'MEC', 'OFFICE', 'ADMIN']:
+        elif not record['position'] and text_upper in ['OWNER', 'SALES', 'MANAGER', 'DRIVER', 'MECHANIC', 'MEC', 'OFFICE', 'ADMIN', 'BROTHER']:
             record['position'] = text_clean
         # Other text might be position or relationship
-        elif len(text_clean) >= 3 and any(c.isalpha() for c in text_clean):
-            if not record['position']:
-                record['position'] = text_clean
+        elif not record['position'] and len(text_clean) >= 3 and any(c.isalpha() for c in text_clean):
+            record['position'] = text_clean
+    
+    # FALLBACK: If no state found yet, search the entire row text for any valid 2-letter state code
+    # This is the same approach MVR Runner uses - catches cases where "IL" appears but wasn't matched above
+    if not record['state']:
+        # Combine all texts into a single string for searching
+        row_text = ' '.join([t.strip() for t in texts])
+        
+        # Apply state corrections to the entire row text FIRST (same as OllamaTool's _clean_ocr_text)
+        # This fixes OCR errors like "1L" → "IL" globally before searching
+        row_text_corrected = _apply_state_corrections_to_text(row_text)
+        row_text_upper = row_text_corrected.upper()
+        
+        # DEBUG: Print what we're searching
+        print(f"[DEBUG] State fallback - original row text: {row_text}")
+        print(f"[DEBUG] State fallback - corrected row text: {row_text_corrected}")
+        
+        # Find all 2-letter codes in the corrected row text
+        all_two_letter_codes = re.findall(r'\b([A-Z0-9|]{2})\b', row_text_upper)
+        print(f"[DEBUG] Found 2-letter codes: {all_two_letter_codes}")
+        
+        # Valid US state codes
+        valid_states = ['AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA','ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY']
+        
+        # Check each 2-letter code
+        for code in all_two_letter_codes:
+            # Normalize the code (handles any remaining OCR errors)
+            normalized_code = _normalize_state(code)
+            print(f"[DEBUG] Code '{code}' normalized to '{normalized_code}'")
+            if normalized_code and normalized_code in valid_states:
+                print(f"[DEBUG] Found valid state: {normalized_code}")
+                record['state'] = normalized_code
+                break  # Found a valid state, stop searching
+        else:
+            print(f"[DEBUG] No valid state found in codes: {all_two_letter_codes}")
     
     return record
 
@@ -366,12 +711,15 @@ def build_tab(parent):
     
     # Processing state
     processing = False
+    extracted_data = None  # Store extracted data for export
     
     def update_status(msg: str):
         status_var.set(msg)
         outer.update_idletasks()
     
     def display_results(data: Dict):
+        nonlocal extracted_data
+        extracted_data = data  # Store for export
         """Display extracted employee data."""
         results_text.config(state="normal")
         results_text.delete("1.0", "end")
@@ -434,20 +782,46 @@ def build_tab(parent):
         def worker():
             nonlocal processing
             try:
+                # Check if file exists
+                if not os.path.isfile(file_path):
+                    outer.after(0, lambda: messagebox.showerror("File Not Found", f"The file does not exist:\n{file_path}"))
+                    update_status("Error: File not found")
+                    processing = False
+                    return
+                
                 update_status("Finding employee table page...")
                 
                 # Find the page with employee tables
                 page_num = _find_employee_table_page(file_path)
                 if page_num is None:
-                    update_status("Error: Could not find employee tables in PDF")
-                    processing = False
-                    return
+                    outer.after(0, lambda: messagebox.showwarning("Page Not Found", "Could not find employee tables in PDF.\nTrying page 2 by default..."))
+                    # Try page 2 (index 1) as fallback
+                    try:
+                        doc = fitz.open(file_path)
+                        if len(doc) >= 2:
+                            page_num = 1
+                        doc.close()
+                    except:
+                        pass
+                    
+                    if page_num is None:
+                        update_status("Error: Could not find employee tables and PDF has less than 2 pages")
+                        processing = False
+                        return
                 
                 update_status(f"OCR scanning page {page_num + 1}...")
+                
+                # Check OCR availability
+                if not _TESSERACT_AVAILABLE and not _EASYOCR_AVAILABLE:
+                    outer.after(0, lambda: messagebox.showerror("OCR Not Available", "Neither Tesseract nor EasyOCR is installed.\nPlease install one:\npip install pytesseract\nOR\npip install easyocr"))
+                    update_status("Error: No OCR engine available")
+                    processing = False
+                    return
                 
                 # OCR the page
                 ocr_items = _ocr_page(file_path, page_num)
                 if not ocr_items:
+                    outer.after(0, lambda: messagebox.showwarning("OCR Failed", "OCR did not extract any text from the page.\nThe page might be blank, corrupted, or the image quality is too low."))
                     update_status("Error: OCR failed - no text extracted")
                     processing = False
                     return
@@ -461,10 +835,19 @@ def build_tab(parent):
                 outer.after(0, lambda: display_results(data))
                 
                 total = len(data['business_personnel']) + len(data['non_business_personnel'])
-                update_status(f"Done! Found {total} people on page {page_num + 1}")
+                if total == 0:
+                    outer.after(0, lambda: messagebox.showinfo("No Employees Found", "The page was scanned but no employee data was found.\nThe table format might be different than expected."))
+                    update_status("Warning: No employees found in extracted text")
+                else:
+                    update_status(f"Done! Found {total} people on page {page_num + 1}")
                 
             except Exception as e:
-                update_status(f"Error: {str(e)}")
+                import traceback
+                error_msg = str(e)
+                error_details = traceback.format_exc()
+                print(f"Extraction error: {error_msg}\n{error_details}")
+                outer.after(0, lambda: messagebox.showerror("Extraction Error", f"An error occurred during extraction:\n\n{error_msg}\n\nCheck console for details."))
+                update_status(f"Error: {error_msg}")
             finally:
                 processing = False
         
@@ -500,6 +883,73 @@ def build_tab(parent):
     
     browse_btn = ttk.Button(btn_frame, text="Browse...", command=browse_file)
     browse_btn.pack(side="left", padx=2)
+    
+    extract_btn = ttk.Button(btn_frame, text="Extract", command=lambda: process_pdf(file_path_var.get()) if file_path_var.get() else messagebox.showwarning("No File", "Please select a PDF file first."))
+    extract_btn.pack(side="left", padx=2)
+    
+    def export_to_mvr():
+        """Export extracted employee data to MVR Runner."""
+        nonlocal extracted_data
+        
+        if not extracted_data:
+            messagebox.showwarning("No Data", "Please extract employee data first.")
+            return
+        
+        # Try to get MVR Runner callback (same method as OllamaTool)
+        callback = None
+        try:
+            from Tabs import MvrRunner
+            callback = getattr(MvrRunner, '_add_mvr_entry_callback', None)
+        except (ImportError, AttributeError):
+            try:
+                import importlib
+                mvr_module = importlib.import_module('Tabs.MvrRunner')
+                callback = getattr(mvr_module, '_add_mvr_entry_callback', None)
+            except Exception:
+                pass
+        
+        if not callback:
+            messagebox.showerror("MVR Runner Not Available", "Could not connect to MVR Runner. Make sure the MVR Runner tab is loaded.")
+            return
+        
+        # Export all business personnel
+        imported = 0
+        skipped = 0
+        
+        for emp in extracted_data.get('business_personnel', []):
+            # Parse name (first word = first name, last word = last name)
+            name_parts = emp.get('name', '').strip().split()
+            first_name = name_parts[0] if name_parts else ''
+            last_name = name_parts[-1] if len(name_parts) > 1 else ''
+            
+            mvr_data = {
+                'first_name': first_name,
+                'last_name': last_name,
+                'license_number': emp.get('license', ''),
+                'state': emp.get('state', ''),
+                'dob': emp.get('dob', ''),
+                'status': emp.get('status', ''),
+                'personal_use': emp.get('personal_use', ''),
+                'extracted_text': f"Dealer Application Reader\nName: {emp.get('name')}\nLicense: {emp.get('license')}\nState: {emp.get('state')}\nDOB: {emp.get('dob')}"
+            }
+            
+            try:
+                success, message = callback(mvr_data, source="Dealer App Reader")
+                if success:
+                    imported += 1
+                else:
+                    skipped += 1
+            except Exception as e:
+                skipped += 1
+        
+        # Show results
+        if imported > 0:
+            messagebox.showinfo("Export Complete", f"Successfully exported {imported} employee(s) to MVR Runner.\n{skipped} skipped (duplicates or errors).")
+        else:
+            messagebox.showwarning("Export Failed", f"No employees exported. {skipped} skipped (may be duplicates or missing required fields).")
+    
+    export_btn = ttk.Button(btn_frame, text="Export to MVR", command=export_to_mvr)
+    export_btn.pack(side="left", padx=2)
     
     # Enable drag-and-drop if available
     if _DND_AVAILABLE and DND_FILES:
